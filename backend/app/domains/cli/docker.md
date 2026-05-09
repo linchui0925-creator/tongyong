@@ -1,0 +1,14 @@
+## Docker 容器命令
+- `docker ps` — 列出运行中的容器
+- `docker ps -a` — 列出所有容器
+- `docker images` — 列出镜像
+- `docker build -t <name> .` — 构建镜像
+- `docker run <image>` — 运行容器
+- `docker stop <container>` — 停止容器
+- `docker rm <container>` — 删除容器
+- `docker rmi <image>` — 删除镜像
+- `docker logs <container>` — 查看容器日志
+- `docker exec -it <container> sh` — 进入容器
+- `docker-compose up` — 启动所有服务
+- `docker-compose down` — 停止所有服务
+- `docker-compose build` — 重新构建服务

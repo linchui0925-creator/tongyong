@@ -1,0 +1,14 @@
+## Python 开发命令
+- `pytest tests/` — 运行测试套件
+- `pytest tests/ -v` — 运行测试（详细模式）
+- `pytest tests/test_file.py::test_func` — 运行指定测试
+- `pip install <package>` — 安装 Python 包
+- `pip install -r requirements.txt` — 安装项目依赖
+- `pip uninstall <package>` — 卸载包
+- `python app/main.py` — 启动 Python 应用
+- `python -m venv venv` — 创建虚拟环境
+- `source venv/bin/activate` — 激活虚拟环境 (macOS/Linux)
+- `python -m black .` — 格式化代码
+- `python -m flake8` — 代码风格检查
+- `python -m mypy .` — 类型检查
+- `python -m pytest --cov` — 测试覆盖率

@@ -1,0 +1,12 @@
+## Node.js 开发命令
+- `node <file>` — 运行 Node.js 文件
+- `npm install` — 安装项目依赖
+- `npm install <package>` — 安装包
+- `npm uninstall <package>` — 卸载包
+- `npm run dev` — 启动开发服务器
+- `npm run build` — 构建项目
+- `npm run test` — 运行测试
+- `npm run lint` — 代码检查
+- `npx <command>` — 直接运行 npx 工具
+- `npx create-react-app <name>` — 创建 React 项目
+- `npx ts-node <file>` — 运行 TypeScript 文件

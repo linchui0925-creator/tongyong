@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>服务诊断</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+        }
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 2em;
+        }
+        .test-section {
+            margin: 30px 0;
+            padding: 25px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border-left: 5px solid #667eea;
+        }
+        .test-title {
+            font-size: 1.3em;
+            color: #667eea;
+            margin-bottom: 15px;
+            font-weight: 600;
+        }
+        .test-item {
+            display: flex;
+            align-items: center;
+            padding: 15px;
+            margin: 10px 0;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        .status-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+            font-size: 20px;
+        }
+        .status-success {
+            background: #10b981;
+            color: white;
+        }
+        .status-error {
+            background: #ef4444;
+            color: white;
+        }
+        .status-pending {
+            background: #f59e0b;
+            color: white;
+        }
+        .status-info {
+            background: #3b82f6;
+            color: white;
+        }
+        .test-details {
+            flex: 1;
+        }
+        .test-label {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        .test-message {
+            color: #666;
+            font-size: 0.9em;
+        }
+        .error-details {
+            margin-top: 10px;
+            padding: 10px;
+            background: #fee;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 0.85em;
+            color: #c00;
+            white-space: pre-wrap;
+        }
+        .next-step {
+            margin-top: 20px;
+            padding: 20px;
+            background: #e0f2fe;
+            border-radius: 10px;
+            border: 2px solid #0ea5e9;
+        }
+        .next-step h3 {
+            color: #0284c7;
+            margin-bottom: 10px;
+        }
+        .next-step ul {
+            margin-left: 20px;
+            color: #0369a1;
+        }
+        .next-step li {
+            margin: 8px 0;
+        }
+        code {
+            background: #f1f5f9;
+            padding: 2px 8px;
+            border-radius: 4px;
+            font-family: monospace;
+            color: #475569;
+        }
+        .highlight {
+            background: #fef3c7;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-weight: bold;
+            color: #92400e;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 TongYong Agent 服务诊断</h1>
+        
+        <div class="test-section">
+            <div class="test-title">📡 1. 检查服务运行状态</div>
+            
+            <div class="test-item">
+                <div class="status-icon status-pending" id="backend-icon">?</div>
+                <div class="test-details">
+                    <div class="test-label">后端服务 (localhost:8000)</div>
+                    <div class="test-message" id="backend-status">检测中...</div>
+                </div>
+            </div>
+            
+            <div class="test-item">
+                <div class="status-icon status-pending" id="frontend-icon">?</div>
+                <div class="test-details">
+                    <div class="test-label">前端服务 (localhost:5173)</div>
+                    <div class="test-message" id="frontend-status">检测中...</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="test-section">
+            <div class="test-title">💬 2. 检查API功能</div>
+            
+            <div class="test-item">
+                <div class="status-icon status-pending" id="health-icon">?</div>
+                <div class="test-details">
+                    <div class="test-label">健康检查</div>
+                    <div class="test-message" id="health-status">检测中...</div>
+                </div>
+            </div>
+            
+            <div class="test-item">
+                <div class="status-icon status-pending" id="chat-icon">?</div>
+                <div class="test-details">
+                    <div class="test-label">聊天功能</div>
+                    <div class="test-message" id="chat-status">检测中...</div>
+                </div>
+            </div>
+            
+            <div class="test-item">
+                <div class="status-icon status-pending" id="memory-icon">?</div>
+                <div class="test-details">
+                    <div class="test-label">记忆功能</div>
+                    <div class="test-message" id="memory-status">检测中...</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="next-step" id="next-steps" style="display: none;">
+            <h3>🔍 下一步</h3>
+            <ul id="recommendations"></ul>
+        </div>
+    </div>
+    
+    <script>
+        const results = {
+            backend: null,
+            frontend: null,
+            health: null,
+            chat: null,
+            memory: null
+        };
+        
+        async function checkBackend() {
+            try {
+                const response = await fetch('http://localhost:8000/');
+                const data = await response.json();
+                results.backend = true;
+                document.getElementById('backend-icon').textContent = '✓';
+                document.getElementById('backend-icon').className = 'status-icon status-success';
+                document.getElementById('backend-status').textContent = `运行中 - ${data.message || 'API服务'}`;
+            } catch (error) {
+                results.backend = false;
+                document.getElementById('backend-icon').textContent = '✗';
+                document.getElementById('backend-icon').className = 'status-icon status-error';
+                document.getElementById('backend-status').textContent = `未运行: ${error.message}`;
+            }
+        }
+        
+        async function checkFrontend() {
+            try {
+                const response = await fetch('http://localhost:5173/');
+                results.frontend = true;
+                document.getElementById('frontend-icon').textContent = '✓';
+                document.getElementById('frontend-icon').className = 'status-icon status-success';
+                document.getElementById('frontend-status').textContent = '运行中 - 前端开发服务器';
+            } catch (error) {
+                results.frontend = false;
+                document.getElementById('frontend-icon').textContent = '✗';
+                document.getElementById('frontend-icon').className = 'status-icon status-error';
+                document.getElementById('frontend-status').textContent = '未运行 - 请运行 npm run dev';
+            }
+        }
+        
+        async function checkHealth() {
+            try {
+                const response = await fetch('http://localhost:8000/health');
+                const data = await response.json();
+                results.health = true;
+                document.getElementById('health-icon').textContent = '✓';
+                document.getElementById('health-icon').className = 'status-icon status-success';
+                document.getElementById('health-status').textContent = 
+                    `正常 - LLM状态: ${data.llm?.status || '未知'} - 会话数: ${data.memory?.sessions || 0}`;
+            } catch (error) {
+                results.health = false;
+                document.getElementById('health-icon').textContent = '✗';
+                document.getElementById('health-icon').className = 'status-icon status-error';
+                document.getElementById('health-status').textContent = `失败: ${error.message}`;
+            }
+        }
+        
+        async function checkChat() {
+            try {
+                const response = await fetch('http://localhost:8000/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: '测试', use_memory: false })
+                });
+                const data = await response.json();
+                results.chat = response.ok && data.reply;
+                document.getElementById('chat-icon').textContent = results.chat ? '✓' : '✗';
+                document.getElementById('chat-icon').className = `status-icon ${results.chat ? 'status-success' : 'status-error'}`;
+                document.getElementById('chat-status').textContent = results.chat 
+                    ? `正常 - AI回复: "${data.reply?.substring(0, 50)}..."`
+                    : `失败: ${data.error || '未知错误'}`;
+            } catch (error) {
+                results.chat = false;
+                document.getElementById('chat-icon').textContent = '✗';
+                document.getElementById('chat-icon').className = 'status-icon status-error';
+                document.getElementById('chat-status').textContent = `失败: ${error.message}`;
+            }
+        }
+        
+        async function checkMemory() {
+            try {
+                const response = await fetch('http://localhost:8000/api/memory/sessions');
+                const data = await response.json();
+                results.memory = response.ok && data.sessions;
+                document.getElementById('memory-icon').textContent = results.memory ? '✓' : '✗';
+                document.getElementById('memory-icon').className = `status-icon ${results.memory ? 'status-success' : 'status-error'}`;
+                document.getElementById('memory-status').textContent = results.memory
+                    ? `正常 - 会话数: ${data.sessions.length}`
+                    : `失败: ${data.detail || '未知错误'}`;
+            } catch (error) {
+                results.memory = false;
+                document.getElementById('memory-icon').textContent = '✗';
+                document.getElementById('memory-icon').className = 'status-icon status-error';
+                document.getElementById('memory-status').textContent = `失败: ${error.message}`;
+            }
+        }
+        
+        function showRecommendations() {
+            const recommendations = [];
+            
+            if (!results.backend) {
+                recommendations.push('<strong>启动后端:</strong> <code>cd backend && python -m uvicorn app.main:app --reload</code>');
+            }
+            
+            if (!results.frontend) {
+                recommendations.push('<strong>启动前端:</strong> <code>cd frontend && npm run dev</code>');
+            }
+            
+            if (results.backend && !results.chat) {
+                recommendations.push('<strong>检查LLM:</strong> 确认API密钥在 .env 文件中正确配置');
+            }
+            
+            if (results.backend && results.frontend && results.chat && results.memory) {
+                recommendations.push('<strong>✅ 所有服务正常!</strong> 请访问 <span class="highlight">http://localhost:5173</span> 使用应用');
+            }
+            
+            if (recommendations.length > 0) {
+                document.getElementById('next-steps').style.display = 'block';
+                document.getElementById('recommendations').innerHTML = 
+                    recommendations.map(r => `<li>${r}</li>`).join('');
+            }
+        }
+        
+        async function runDiagnostics() {
+            await Promise.all([
+                checkBackend(),
+                checkFrontend(),
+                checkHealth(),
+                checkChat(),
+                checkMemory()
+            ]);
+            
+            showRecommendations();
+        }
+        
+        // 运行诊断
+        runDiagnostics();
+        
+        // 每5秒刷新一次
+        setInterval(runDiagnostics, 5000);
+    </script>
+</body>
+</html>

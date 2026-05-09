@@ -1,0 +1,40 @@
+{
+  "provider": "minimax",
+  "model": "MiniMax-M2.5",
+  "api_keys": {
+    "tongyi": "sk-7b080ec258704e5794529f7f2ab00b93",
+    "openai": "sk-openai-test-123",
+    "anthropic": "sk-7a74bc3759314bd38a032b3b37e99332",
+    "deepseek": "sk-01a9ef33cff04656b43713b38d61ad7a",
+    "minimax": "sk-cp-X7dE4b7XCJUSDJJ4ENz5vFlSUUAB8WFqyCLhFrwFO6r961stLfJNuvKpPqVuFBGSGukHIujxjaOBK3n2OVLTeQhp4WMO9Wd_jSiyXlimpuyjzVNExRPb-LM",
+    "moonshot": "test-key",
+    "stepfun": "test-key",
+    "siliconflow": "test-key"
+  },
+  "saved_models": [
+    {
+      "provider": "minimax",
+      "model": "MiniMax-M2.5",
+      "api_key": "sk-cp-X7dE4b7XCJUSDJJ4ENz5vFlSUUAB8WFqyCLhFrwFO6r961stLfJNuvKpPqVuFBGSGukHIujxjaOBK3n2OVLTeQhp4WMO9Wd_jSiyXlimpuyjzVNExRPb-LM",
+      "api_endpoint": "https://api.minimaxi.com/v1",
+      "name": "MiniMax (中国站) — MiniMax-M2.5",
+      "id": "cb1baa84a478"
+    },
+    {
+      "provider": "openai",
+      "model": "gpt-4o",
+      "api_key": "sk-openai-test-123",
+      "api_endpoint": "https://api.openai.com/v1",
+      "name": "OpenAI — GPT-4o",
+      "id": "5ffffa6e2d90"
+    },
+    {
+      "provider": "deepseek",
+      "model": "deepseek-reasoner",
+      "api_key": "sk-01a9ef33cff04656b43713b38d61ad7a",
+      "api_endpoint": "https://api.deepseek.com/v1",
+      "name": "DeepSeek — deepseek-reasoner",
+      "id": "99a3a3a33d37"
+    }
+  ]
+}

@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>API连接测试</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .test-result {
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        .success {
+            background-color: #d4edda;
+            border: 1px solid #28a745;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            border: 1px solid #dc3545;
+            color: #721c24;
+        }
+        .pending {
+            background-color: #fff3cd;
+            border: 1px solid #ffc107;
+            color: #856404;
+        }
+        pre {
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 3px;
+            overflow-x: auto;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 10px 5px 10px 0;
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <h1>🔧 TongYong Agent API连接测试</h1>
+    
+    <h2>测试1: 前端到后端API的连接</h2>
+    <button onclick="testBackendAPI()">测试后端API</button>
+    <div id="test1-result" class="test-result pending">等待测试...</div>
+    <pre id="test1-output"></pre>
+    
+    <h2>测试2: 健康检查</h2>
+    <button onclick="testHealth()">健康检查</button>
+    <div id="test2-result" class="test-result pending">等待测试...</div>
+    <pre id="test2-output"></pre>
+    
+    <h2>测试3: 聊天功能</h2>
+    <button onclick="testChat()">发送测试消息</button>
+    <div id="test3-result" class="test-result pending">等待测试...</div>
+    <pre id="test3-output"></pre>
+    
+    <h2>测试4: 会话列表</h2>
+    <button onclick="testSessions()">获取会话列表</button>
+    <div id="test4-result" class="test-result pending">等待测试...</div>
+    <pre id="test4-output"></pre>
+    
+    <script>
+        const API_BASE = 'http://localhost:8000';
+        
+        async function testBackendAPI() {
+            const resultDiv = document.getElementById('test1-result');
+            const outputDiv = document.getElementById('test1-output');
+            
+            resultDiv.textContent = '测试中...';
+            resultDiv.className = 'test-result pending';
+            
+            try {
+                const response = await fetch(`${API_BASE}/`);
+                const data = await response.json();
+                
+                resultDiv.textContent = `✅ 成功! 状态码: ${response.status}`;
+                resultDiv.className = 'test-result success';
+                outputDiv.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                resultDiv.textContent = `❌ 失败: ${error.message}`;
+                resultDiv.className = 'test-result error';
+                outputDiv.textContent = `错误详情:\n${error.stack}`;
+            }
+        }
+        
+        async function testHealth() {
+            const resultDiv = document.getElementById('test2-result');
+            const outputDiv = document.getElementById('test2-output');
+            
+            resultDiv.textContent = '测试中...';
+            resultDiv.className = 'test-result pending';
+            
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                
+                resultDiv.textContent = `✅ 成功! LLM状态: ${data.llm?.status || '未知'}`;
+                resultDiv.className = 'test-result success';
+                outputDiv.textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                resultDiv.textContent = `❌ 失败: ${error.message}`;
+                resultDiv.className = 'test-result error';
+                outputDiv.textContent = `错误详情:\n${error.stack}`;
+            }
+        }
+        
+        async function testChat() {
+            const resultDiv = document.getElementById('test3-result');
+            const outputDiv = document.getElementById('test3-output');
+            
+            resultDiv.textContent = '测试中...';
+            resultDiv.className = 'test-result pending';
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/chat`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        message: '你好，请简单介绍一下自己',
+                        use_memory: false
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.textContent = `✅ 成功! 回复长度: ${data.reply?.length || 0} 字符`;
+                    resultDiv.className = 'test-result success';
+                    outputDiv.textContent = JSON.stringify(data, null, 2);
+                } else {
+                    resultDiv.textContent = `❌ HTTP错误: ${response.status}`;
+                    resultDiv.className = 'test-result error';
+                    outputDiv.textContent = JSON.stringify(data, null, 2);
+                }
+            } catch (error) {
+                resultDiv.textContent = `❌ 失败: ${error.message}`;
+                resultDiv.className = 'test-result error';
+                outputDiv.textContent = `错误详情:\n${error.stack}`;
+            }
+        }
+        
+        async function testSessions() {
+            const resultDiv = document.getElementById('test4-result');
+            const outputDiv = document.getElementById('test4-output');
+            
+            resultDiv.textContent = '测试中...';
+            resultDiv.className = 'test-result pending';
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/memory/sessions`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.textContent = `✅ 成功! 会话数量: ${data.sessions?.length || 0}`;
+                    resultDiv.className = 'test-result success';
+                    outputDiv.textContent = JSON.stringify(data, null, 2);
+                } else {
+                    resultDiv.textContent = `❌ HTTP错误: ${response.status}`;
+                    resultDiv.className = 'test-result error';
+                    outputDiv.textContent = JSON.stringify(data, null, 2);
+                }
+            } catch (error) {
+                resultDiv.textContent = `❌ 失败: ${error.message}`;
+                resultDiv.className = 'test-result error';
+                outputDiv.textContent = `错误详情:\n${error.stack}`;
+            }
+        }
+        
+        // 自动运行基础测试
+        window.onload = function() {
+            console.log('页面加载完成，开始自动测试...');
+            testBackendAPI();
+        };
+    </script>
+</body>
+</html>

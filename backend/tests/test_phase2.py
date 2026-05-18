@@ -9,11 +9,16 @@ import sqlite3
 import os
 import sys
 import json
+import asyncio
 from datetime import datetime
 from unittest.mock import Mock, AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.core.agent import AgentEngine
+from app.core.iteration_budget import IterationBudget
+from app.llm.base import LLMResponse, ToolCallResult
+from app.llm.openai_compatible import OpenAICompatibleLLM
 from app.memory.storage import MemoryStorage
 from app.hermes.memory_file import MemoryFileManager
 from app.skills.manager import SkillManager
@@ -245,7 +250,107 @@ class TestMemoryStorage:
         assert len(messages) == 0
 
 
+class TestRegressionFixes:
+    """本轮缺陷修复的回归测试"""
+
+    def test_openai_compatible_fallback_embedding_works_without_api_key(self):
+        llm = OpenAICompatibleLLM(api_key="")
+
+        embedding = asyncio.run(llm.get_embedding("hello"))
+
+        assert isinstance(embedding, list)
+        assert len(embedding) == 1024
+        assert all(isinstance(x, float) for x in embedding)
+
+    def test_iteration_budget_allows_configured_grace_calls(self):
+        budget = IterationBudget(max_rounds=10, soft_limit=8, grace_calls=2)
+
+        advances = [budget.advance() for _ in range(10)]
+
+        assert advances == [True, True, True, True, True, True, True, True, True, False]
+        assert budget.current_round == 10
+        assert budget.grace_used == 2
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_persists_streamed_reply(self, tmp_db):
+        storage = MemoryStorage(db_path=tmp_db)
+        engine = AgentEngine(llm=StubLLM(["最终回复"]))
+        engine.memory_storage = storage
+        engine.vector_store = StubVectorStore()
+
+        events = []
+        async for item in engine.stream_chat(session_id=None, message="你好", use_memory=False):
+            events.append(item)
+
+        session_id = next(e["session_id"] for e in events if e.get("type") == "done")
+        messages = await storage.get_messages(session_id)
+
+        assert messages[-1].role == "assistant"
+        assert messages[-1].content == "最终回复"
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_handles_missing_cli_executor(self, tmp_db):
+        storage = MemoryStorage(db_path=tmp_db)
+        engine = AgentEngine(llm=StubLLM(["```bash\npwd\n```"]))
+        engine.memory_storage = storage
+        engine.vector_store = StubVectorStore()
+
+        with patch.object(engine, "_get_cli_executor", return_value=None):
+            events = [item async for item in engine.stream_chat(session_id=None, message="执行命令", use_memory=False)]
+
+        content_events = [e for e in events if e.get("type") == "content"]
+        assert any("```bash\npwd\n```" in e["content"] for e in content_events)
+        assert events[-1]["type"] == "done"
+
+
 # ── MemoryFileManager Tests ──────────────────────────────────
+
+
+class StubLLM:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.model = "stub"
+
+    async def chat(self, messages, tools=None):
+        if not self._responses:
+            raise AssertionError("No more stub responses available")
+        return LLMResponse(content=self._responses.pop(0))
+
+    async def get_embedding(self, text):
+        return [0.0, 0.0, 0.0]
+
+
+class StubToolManager:
+    def __init__(self, results=None):
+        self.results = list(results or [])
+        self.calls = []
+
+    def get_schemas(self):
+        return [{
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "search",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+            },
+        }]
+
+    def list_tools(self):
+        return ["web_search"]
+
+    async def execute(self, tool_name, arguments):
+        self.calls.append((tool_name, arguments))
+        if self.results:
+            return self.results.pop(0)
+        return "ok"
+
+
+class StubVectorStore:
+    async def search(self, *args, **kwargs):
+        return []
+
+    async def add_text(self, *args, **kwargs):
+        return "vector-id"
 
 class TestMemoryFileManager:
     """Hermes 平文件记忆管理器测试"""

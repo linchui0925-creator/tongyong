@@ -346,6 +346,40 @@
   opacity: 0.7;
 }
 
+/* ========== Agent 步骤历史 ========== */
+.chat-step-history {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: var(--sp-2);
+  padding: var(--sp-2);
+  background: var(--bg-tertiary);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.chat-step {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-secondary);
+}
+.chat-step.done {
+  color: var(--text-muted);
+}
+.chat-step.current {
+  color: var(--accent, #6c7278);
+}
+.chat-step-icon {
+  font-size: 11px;
+  width: 14px;
+  flex-shrink: 0;
+}
+.chat-step.done .chat-step-icon { color: #4ade80; }
+.chat-step.current .chat-step-icon { color: var(--accent, #6c7278); }
+.chat-step-text {
+  flex: 1;
+}
+
 /* ========== 工具执行仪表板（仅当前运行工具） ========== */
 .chat-tools-dashboard {
   display: flex;
@@ -455,6 +489,13 @@
   font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
+.chat-statusbar-token {
+  color: var(--accent);
+  font-feature-settings: 'tnum';
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
 
 /* ========== 思考过程展开/收起 ========== */
 .chat-thinking-toggle {
@@ -489,4 +530,78 @@
   white-space: pre-wrap;
   max-height: 300px;
   overflow-y: auto;
+}
+
+/* ========== Clarify 交互选择 UI ========== */
+.chat-clarify {
+  padding: var(--sp-4) var(--sp-5);
+  border-top: 1px solid var(--border);
+  background: var(--bg-secondary);
+  flex-shrink: 0;
+  animation: slideUp 0.15s ease;
+}
+
+.chat-clarify-question {
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: var(--sp-3);
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--bg-primary);
+  border-radius: var(--r-lg);
+  border-left: 3px solid var(--accent);
+}
+
+.chat-clarify-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+}
+
+.chat-clarify-choice {
+  padding: var(--sp-2) var(--sp-3);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: all var(--t-fast);
+}
+
+.chat-clarify-choice:hover {
+  border-color: var(--accent);
+  background: var(--accent-subtle);
+  color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.chat-clarify-choice:active {
+  transform: translateY(0);
+}
+
+.chat-clarify-input {
+  margin-top: var(--sp-2);
+}
+
+.chat-clarify-input input {
+  width: 100%;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 14px;
+  outline: none;
+  transition: all var(--t-fast);
+  box-sizing: border-box;
+}
+
+.chat-clarify-input input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
+}
+
+.chat-clarify-input input::placeholder {
+  color: var(--text-muted);
 }

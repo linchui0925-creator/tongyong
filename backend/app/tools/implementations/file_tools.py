@@ -180,7 +180,22 @@ def _check_staleness(resolved_path: str, task_id: str = "default") -> Optional[s
 
 def _resolve_path(path: str) -> Optional[Path]:
     """解析并验证路径安全性"""
-    p = Path(path).expanduser().resolve()
+    raw = Path(path).expanduser()
+    if raw.is_absolute():
+        p = raw.resolve()
+    else:
+        cwd = Path.cwd().resolve()
+        if cwd.name == "backend":
+            repo_root = cwd.parent
+        else:
+            repo_root = cwd
+
+        path_str = str(raw).replace("\\", "/")
+        if path_str.startswith("backend/") and cwd.name == "backend":
+            raw = Path(path_str[len("backend/"):])
+            p = (cwd / raw).resolve()
+        else:
+            p = (repo_root / raw).resolve()
     if str(p) in _BLOCKED_DEVICE_PATHS:
         return None
     return p
@@ -325,7 +340,7 @@ async def read_file_tool(path: str, offset: int = 1, limit: int = 200, task_id: 
             except OSError:
                 pass
 
-    if count >= 4 and was_dedup_hit:
+    if count >= 2 and was_dedup_hit:
         return (
             f"BLOCKED: You have read this exact file region {count} times in a row. "
             "The content has NOT changed. You already have this information. "
@@ -403,7 +418,10 @@ async def read_file_tool(path: str, offset: int = 1, limit: int = 200, task_id: 
 
 def _detect_encoding(path: Path) -> str:
     """尝试检测文件编码"""
-    import chardet
+    try:
+        import chardet
+    except Exception:
+        return "utf-8"
     try:
         raw = path.read_bytes()[:8192]
         result = chardet.detect(raw)
@@ -648,6 +666,7 @@ async def search_files_tool(pattern: str, path: str = ".", type: str = "content"
 
 registry.register(
     name="read_file",
+    toolset="file",
     description="读取文件内容。支持指定起始行和行数范围，自动检测编码，安全过滤设备文件。大文件建议用 offset+limit 分段读取。内置去重：相同文件重复读取时会提示使用已有结果。",
     schema=READ_FILE_SCHEMA,
     handler=read_file_tool,
@@ -659,6 +678,7 @@ registry.register(
 
 registry.register(
     name="write_file",
+    toolset="file",
     description="创建新文件或覆盖已有文件。自动创建父目录。拒绝写入敏感系统路径。如文件在读取后被外部修改会给出警告。",
     schema=WRITE_FILE_SCHEMA,
     handler=write_file_tool,
@@ -669,6 +689,7 @@ registry.register(
 
 registry.register(
     name="patch",
+    toolset="file",
     description="精确替换文件中的文本（replace 模式），或在文件开头/末尾插入内容。比 write_file 更安全，只修改指定部分。支持 replace_all 替换所有匹配项。",
     schema=PATCH_SCHEMA,
     handler=patch_tool,
@@ -679,6 +700,7 @@ registry.register(
 
 registry.register(
     name="search_files",
+    toolset="file",
     description="搜索文件内容或文件名。支持正则表达式和 glob 通配符过滤。自动跳过 .git/node_modules 等目录。",
     schema=SEARCH_FILES_SCHEMA,
     handler=search_files_tool,

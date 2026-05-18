@@ -3,7 +3,7 @@ OpenAI LLM实现 - 支持GPT系列模型的对话和嵌入
 使用OpenAI官方API，提供稳定的对话和嵌入服务
 """
 from typing import List, Optional, AsyncIterator, Dict, Any
-from openai import AsyncOpenAI, APIError, Timeout
+from openai import AsyncOpenAI, APIError, APITimeoutError
 from app.llm.base import BaseLLM, LLMError, LLMResponse, ToolCallResult
 from app.core.base import Message
 import logging
@@ -113,7 +113,7 @@ class OpenAILLM(BaseLLM):
                     logger.info(f"OpenAI响应成功，回复长度: {len(reply)}")
                     return LLMResponse(content=reply)
 
-                except Timeout:
+                except APITimeoutError:
                     logger.warning(f"OpenAI请求超时 (尝试 {attempt + 1}/{self.MAX_RETRIES})")
                     if attempt == self.MAX_RETRIES - 1:
                         raise LLMError("请求超时", "TIMEOUT")

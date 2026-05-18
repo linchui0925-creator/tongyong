@@ -18,6 +18,7 @@ from app.hermes import MemoryFileManager, SkillFileManager
 from app.gateway import openai_router
 from app.gateway.config import GatewaySettings
 from app.gateway.openai_api import init_gateway as init_gateway_api
+from app.gateway.desktop_bridge import router as desktop_bridge_router
 import logging
 import time
 import sys
@@ -42,31 +43,24 @@ app = FastAPI(
     redoc_url="/redoc" if settings.debug else None
 )
 
-# 初始化LLM
-def initialize_llm():
-    """初始化LLM引擎"""
-    try:
-        from app.llm.factory import get_llm
-        llm_instance = get_llm()
-        logger.info(f"LLM初始化成功: {type(llm_instance).__name__}")
-        return llm_instance
-    except Exception as e:
-        logger.error(f"LLM初始化失败: {e}", exc_info=True)
-        return None
-
-# 初始化Agent引擎
-llm_instance = initialize_llm()
-agent_engine = AgentEngine(llm=llm_instance)
+# 初始化Agent引擎（不传 LLM，延迟注入）
+agent_engine = AgentEngine(llm=None)
 logger.info("AgentEngine初始化完成")
 
-# 将 LLM 实例和 AgentEngine 同步到 LLMManager，使模型切换自动生效
+# 将 AgentEngine 同步到 LLMManager，使模型切换自动生效
 from app.services.llm_manager import get_llm_manager
 _llm_mgr = get_llm_manager()
-_llm_mgr._seed_initial_llm(llm_instance, settings.default_llm_provider)
-# 尝试从保存的配置恢复上次使用的 provider（如 minimax），
-# 避免重启后丢失用户手动添加/切换的模型
-_llm_mgr.try_restore_saved_provider()
 _llm_mgr.bind_agent_engine(agent_engine)
+# 尝试从保存的配置恢复上次使用的 provider（如 minimax），
+# 恢复成功后会同步到 AgentEngine；失败则用默认 provider 创建并注入
+restored = _llm_mgr.try_restore_saved_provider()
+if not restored:
+    from app.llm.factory import get_llm
+    llm_instance = get_llm()
+    logger.info(f"LLM初始化成功: {type(llm_instance).__name__}")
+    _llm_mgr._seed_initial_llm(llm_instance, settings.default_llm_provider)
+if agent_engine.llm is None:
+    _llm_mgr._sync_to_agent()
 
 # CORS中间件配置
 app.add_middleware(
@@ -113,6 +107,7 @@ app.include_router(skills_api.router)
 app.include_router(tool_harness_api.router)
 app.include_router(stream_router, prefix="/api/chat")
 app.include_router(openai_router, prefix="/v1")
+app.include_router(desktop_bridge_router)
 
 # 初始化 OpenAI-gateway 配置
 _gateway_settings = GatewaySettings()
@@ -187,7 +182,20 @@ async def startup_event():
     logger.info("=" * 50)
     logger.info(f"{settings.app_name} 启动中...")
     logger.info("=" * 50)
-    
+
+    # 发现并注册所有内置工具，同时生成 tools.md
+    from app.tools import discover_builtin_tools
+    from app.tools.registry import generate_tools_md
+    discover_builtin_tools()
+    generate_tools_md()
+
+    # 动态发现 MCP 服务器工具
+    try:
+        from app.tools.mcp_client import discover_mcp_tools
+        discover_mcp_tools()
+    except Exception as e:
+        logger.warning(f"MCP 工具发现失败: {e}")
+
     # 验证数据库连接
     try:
         sessions = await agent_engine.get_sessions()

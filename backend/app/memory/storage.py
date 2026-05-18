@@ -13,7 +13,7 @@ class MemoryStorage:
         self.db_path = db_path
         os.makedirs(os.path.dirname(db_path) if os.path.dirname(db_path) else "./data", exist_ok=True)
         self.init_tables()
-    
+
     def init_tables(self):
         db_dir = os.path.dirname(self.db_path) if self.db_path != "./data/tongyong.db" else "./data"
         if db_dir and not os.path.exists(db_dir):
@@ -121,7 +121,7 @@ class MemoryStorage:
             created_at=datetime.now().isoformat(),
             updated_at=datetime.now().isoformat()
         )
-        
+
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -130,7 +130,7 @@ class MemoryStorage:
         )
         conn.commit()
         conn.close()
-        
+
         return session
     
     async def get_sessions(self) -> List[Session]:
@@ -139,7 +139,7 @@ class MemoryStorage:
         cursor.execute("SELECT id, name, created_at, updated_at FROM sessions ORDER BY updated_at DESC")
         rows = cursor.fetchall()
         conn.close()
-        
+
         return [
             Session(id=row[0], name=row[1], created_at=row[2], updated_at=row[3])
             for row in rows
@@ -251,7 +251,7 @@ class MemoryStorage:
                 created_at=row[4],
                 sequence=row[5]
             )
-        for row in rows
+            for row in rows
         ]
     
     async def get_previous_message(self, session_id: str, current_sequence: int) -> Optional[Message]:

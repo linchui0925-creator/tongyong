@@ -1,10 +1,10 @@
 """
 IterationBudget - 工具调用迭代预算控制
 
-Hermes风格的预算控制，支持 soft/hard limit 和 grace call 机制。
+迭代预算控制，支持 soft/hard limit 和 grace call 机制。
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -19,9 +19,9 @@ class IterationBudget:
         current_round: 当前轮次计数
         grace_used: 已使用的 grace calls 数量
     """
-    max_rounds: int = 10
-    soft_limit: int = 8
-    grace_calls: int = 2
+    max_rounds: int = 20
+    soft_limit: int = 16
+    grace_calls: int = 4
     current_round: int = 0
     grace_used: int = 0
 
@@ -56,18 +56,18 @@ class IterationBudget:
         Returns:
             True 如果迭代应该继续，False 如果应该停止
         """
-        self.current_round += 1
-
         if self.is_exhausted:
             return False
 
-        if self.is_approaching_limit and not self.can_grace_call:
+        self.current_round += 1
+
+        if self.current_round > self.soft_limit and not self.can_grace_call:
             return False
 
-        if self.is_approaching_limit and self.can_grace_call:
+        if self.current_round > self.soft_limit and self.can_grace_call:
             self.grace_used += 1
 
-        return True
+        return not self.is_exhausted
 
     def get_warning_message(self) -> Optional[str]:
         """获取接近上限警告消息"""
@@ -76,7 +76,7 @@ class IterationBudget:
                 f"[预算警告] 工具调用轮次即将耗尽（已使用 {self.current_round} 轮，"
                 f"剩余 {self.remaining} 轮）。请准备结束或合并后续操作。"
             )
-        if self.in_grace_period:
+        if self.current_round > self.soft_limit and self.in_grace_period:
             return (
                 f"[预算警告] 进入 grace period（已用 {self.grace_used}/{self.grace_calls} 次 grace）。"
                 f"剩余 {self.remaining} 轮。"

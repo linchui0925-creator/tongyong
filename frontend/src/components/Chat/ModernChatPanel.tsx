@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { streamChat, generateMessageId } from '../../api/stream';
 import { getSessionMessages } from '../../api/memory';
+import { submitClarifyAnswer } from '../../api/chat';
 import { Message } from '../../types';
 import './ModernChatPanel.css';
 
@@ -21,6 +22,13 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
   const [currentTool, setCurrentTool] = useState<{name: string; emoji: string; startTime: number} | null>(null);
   const [toolElapsed, setToolElapsed] = useState<number>(0);
   const [expandedThinkingMsgId, setExpandedThinkingMsgId] = useState<string | null>(null);
+  const [waitingQuestion, setWaitingQuestion] = useState<{question: string; choices: string[]; id: string} | null>(null);
+  const [waitingAnswer, setWaitingAnswer] = useState('');
+  // 步骤历史：展示 agent 工作 pipeline
+  const [stepHistory, setStepHistory] = useState<Array<{id: string; text: string; status: 'done' | 'current'; emoji?: string}>>([]);
+  const [executionSummary, setExecutionSummary] = useState<string[]>([]);
+  // Token 使用量
+  const [tokenUsage, setTokenUsage] = useState<{input: number; output: number; total: number} | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -28,6 +36,12 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
   const isNearBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  const looksLikeExecutionClaim = useCallback((content: string) => {
+    const text = (content || '').toLowerCase();
+    const patterns = ['已调用', '已执行', '已打开', '已访问', '已搜索', '已截图', '已导航', '我已经调用', '我已调用'];
+    return patterns.some((p) => text.includes(p));
+  }, []);
 
   // Sync session
   useEffect(() => {
@@ -39,13 +53,23 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
     if (!sid) return;
     try {
       const data = await getSessionMessages(sid);
-      const msgs: Message[] = (data.messages || []).map((m: any, i: number) => ({
-        id: m.id || `msg-${i}`,
-        role: m.role,
-        content: m.content,
-        timestamp: new Date(m.created_at || Date.now()).getTime(),
-        status: 'completed' as const,
-      }));
+      const msgs: Message[] = (data.messages || []).map((m: any, i: number) => {
+        // 清理 content 中的 thinking 标签和特殊 token（离线保存时可能未清理）
+        const rawContent = m.content || '';
+        // 清理 <|im_start|>...<|im_end|> 标签（MiniMax 模型输出）
+        const cleanedForThink = rawContent.replace(/<\|im_start\|[^|]*\|[^>]*>[\s\S]*?<\|im_end\|>/g, '');
+        const thinkMatch = cleanedForThink.match(/<think>([\s\S]*?)晖/);
+        const thinking = thinkMatch ? thinkMatch[1] : '';
+        const displayContent = cleanedForThink.replace(/<think>[\s\S]*?晖/g, '').trim();
+        return {
+          id: m.id || `msg-${i}`,
+          role: m.role,
+          content: displayContent,
+          thinking: thinking || undefined,
+          timestamp: new Date(m.created_at || Date.now()).getTime(),
+          status: 'completed' as const,
+        };
+      });
       setMessages(msgs);
     } catch {
       setMessages([]);
@@ -96,6 +120,9 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
     setElapsed(0);
     setToolElapsed(0);
     setCurrentTool(null);
+    setStepHistory([]);
+    setExecutionSummary([]);
+    setTokenUsage(null);
     if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = setInterval(() => {
       setElapsed(prev => prev + 100);
@@ -111,19 +138,47 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
       },
       onProgress: (content) => {
         setProgressText(content);
+        // 记录步骤：完成上一个步骤，标记当前步骤
+        if (content && content !== progressText) {
+          setStepHistory(prev => {
+            const updated = prev.map(s => s.status === 'current' ? { ...s, status: 'done' as const } : s);
+            const exists = updated.some(s => s.text === content);
+            if (!exists) {
+              updated.push({ id: `step-${generateMessageId()}`, text: content, status: 'current' as const });
+            }
+            return updated;
+          });
+        }
       },
       onToolStart: (toolName, _args, emoji) => {
         setToolElapsed(0);
         setCurrentTool({ name: toolName, emoji, startTime: Date.now() });
+        // 工具启动：完成当前步骤，记录工具步骤
+        setStepHistory(prev => {
+          const updated = prev.map(s => s.status === 'current' ? { ...s, status: 'done' as const } : s);
+          updated.push({ id: `tool-${generateMessageId()}`, text: `⚡ 调用 ${toolName}`, status: 'done' as const, emoji });
+          return updated;
+        });
       },
-      onToolComplete: (_toolName, _preview, _duration, _emoji) => {
+      onToolComplete: (toolName, preview, duration, emoji) => {
         setCurrentTool(null);
+        if (preview) {
+          setExecutionSummary(prev => [...prev.slice(-5), `${emoji} ${toolName} (${duration.toFixed(1)}s): ${preview}`]);
+        }
       },
-      onToolError: (_toolName, _error, _emoji) => {
+      onToolError: (toolName, error, emoji) => {
         setCurrentTool(null);
+        setExecutionSummary(prev => [...prev.slice(-5), `${emoji} ${toolName} 出错: ${error}`]);
       },
-      onToolFeedback: (_content) => {
-        // 忽略工具反馈，不显示在回复内容中
+      onToolFeedback: (content) => {
+        if (content) {
+          setExecutionSummary(prev => [...prev.slice(-5), content]);
+        }
+      },
+      onBudgetWarning: (content) => {
+        if (content) {
+          setExecutionSummary(prev => [...prev.slice(-5), content]);
+        }
       },
       onThinkingDelta: (content) => {
         setMessages(prev => prev.map(m =>
@@ -132,6 +187,15 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
       },
       onThinkingDone: () => {
         // thinking done
+      },
+      onAsk: (question, choices, question_id) => {
+        setWaitingQuestion({ question, choices, id: question_id });
+        setWaitingAnswer('');
+        setIsStreaming(false);
+        setProgressText('等待回答...');
+      },
+      onUsage: (input, output, total) => {
+        setTokenUsage({ input, output, total });
       },
       onContent: (_chunk, full) => {
         setProgressText('');
@@ -143,11 +207,19 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
           m.id === aid ? { ...m, content: displayContent, thinking: thinking || m.thinking, status: 'streaming' as const } : m
         ));
       },
-      onDone: () => {
+      onDone: (data) => {
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
         setProgressText('');
+        setCurrentTool(null);
+        setStepHistory([]);  // 完成时清空步骤历史
         setMessages(prev => prev.map(m =>
-          m.id === aid ? { ...m, status: 'completed' as const } : m
+          m.id === aid ? {
+            ...m,
+            status: 'completed' as const,
+            toolsUsed: data.tools_used || [],
+            commandsExecuted: data.commands_executed || [],
+            executionClaimMismatch: looksLikeExecutionClaim(m.content) && !((data.tools_used && data.tools_used.length > 0) || (data.commands_executed && data.commands_executed.length > 0)),
+          } : m
         ));
         setIsStreaming(false);
         setIsLoading(false);
@@ -157,6 +229,8 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
         if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
         setProgressText('');
         setErrorMessage(err);
+        setStepHistory([]);
+        setCurrentTool(null);
         setMessages(prev => prev.map(m =>
           m.id === aid ? { ...m, status: 'error' as const, error: err } : m
         ));
@@ -173,6 +247,8 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
     setIsStreaming(false);
     setIsLoading(false);
     setProgressText('');
+    setCurrentTool(null);
+    setStepHistory([]);
     setMessages(prev => prev.map(m =>
       m.status === 'streaming' ? { ...m, status: 'completed' as const } : m
     ));
@@ -252,6 +328,27 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
                           <span className="chat-thinking-dots">
                             <span /><span /><span />
                           </span>
+                          {/* 步骤历史：展示 agent pipeline */}
+                          {stepHistory.length > 0 && (
+                            <div className="chat-step-history">
+                              {stepHistory.map((step) => (
+                                <div key={step.id} className={`chat-step ${step.status}`}>
+                                  <span className="chat-step-icon">{step.status === 'done' ? '✓' : '›'}</span>
+                                  <span className="chat-step-text">{step.text}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          {executionSummary.length > 0 && (
+                            <div className="chat-step-history">
+                              {executionSummary.map((line, i) => (
+                                <div key={`${i}-${line.slice(0, 12)}`} className="chat-step done">
+                                  <span className="chat-step-icon">•</span>
+                                  <span className="chat-step-text">{line}</span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
                         </div>
                       ) : (
                         <>
@@ -276,6 +373,13 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
                               {msg.thinking}
                             </div>
                           )}
+                        </div>
+                      )}
+                      {msg.executionClaimMismatch && (
+                        <div className="chat-thinking-toggle">
+                          <div className="chat-thinking-content" style={{ color: 'var(--danger)' }}>
+                            该回复声称已经执行操作，但前端没有检测到本轮真实工具调用或命令执行。
+                          </div>
                         </div>
                       )}
                     </div>
@@ -312,7 +416,184 @@ function ModernChatPanel({ initialSessionId }: ModernChatPanelProps) {
         <div className="chat-statusbar">
           <span className="chat-statusbar-dot" />
           <span className="chat-statusbar-text">{progressText || '思考中...'}</span>
+          {tokenUsage && (
+            <span className="chat-statusbar-token">⏱ {tokenUsage.total}</span>
+          )}
           <span className="chat-statusbar-elapsed">{(elapsed / 1000).toFixed(1)}s</span>
+        </div>
+      )}
+      {/* 工具执行中 */}
+      {isStreaming && currentTool && tokenUsage && (
+        <div className="chat-statusbar">
+          <span className="chat-statusbar-dot" />
+          <span className="chat-statusbar-text">{progressText || '执行中...'}</span>
+          <span className="chat-statusbar-token">⏱ {tokenUsage.total}</span>
+          <span className="chat-statusbar-elapsed">{(elapsed / 1000).toFixed(1)}s</span>
+        </div>
+      )}
+
+      {/* Clarify 交互 UI */}
+      {waitingQuestion && (
+        <div className="chat-clarify">
+          <div className="chat-clarify-question">{waitingQuestion.question}</div>
+          <div className="chat-clarify-choices">
+            {waitingQuestion.choices.map((choice, i) => (
+              <button
+                key={i}
+                className="chat-clarify-choice"
+                onClick={async () => {
+                  await submitClarifyAnswer(waitingQuestion.id, choice, currentSessionId || undefined);
+                  setWaitingQuestion(null);
+                  setWaitingAnswer('');
+                  setIsLoading(true);
+                  setIsStreaming(true);
+                  setProgressText('继续中...');
+                  setExecutionSummary([]);
+                  setStepHistory([]);
+                  // 重新发起流式请求，续上对话
+                  const uid = generateMessageId();
+                  const aid = generateMessageId();
+                  setMessages(prev => [...prev,
+                    { id: uid, role: 'user', content: choice, timestamp: Date.now(), status: 'completed' as const },
+                    { id: aid, role: 'assistant', content: '', timestamp: Date.now(), status: 'streaming' as const },
+                  ]);
+                  abortRef.current = streamChat(choice, currentSessionId || undefined, true, {
+                    onStart: () => {
+                      setIsStreaming(true);
+                      setProgressText('继续中...');
+                    },
+                    onProgress: (content) => setProgressText(content),
+                    onToolStart: (toolName, _args, emoji) => {
+                      setToolElapsed(0);
+                      setCurrentTool({ name: toolName, emoji, startTime: Date.now() });
+                    },
+                    onToolComplete: (toolName, preview, duration, emoji) => {
+                      setCurrentTool(null);
+                      if (preview) {
+                        setExecutionSummary(prev => [...prev.slice(-5), `${emoji} ${toolName} (${duration.toFixed(1)}s): ${preview}`]);
+                      }
+                    },
+                    onToolError: (toolName, error, emoji) => {
+                      setCurrentTool(null);
+                      setExecutionSummary(prev => [...prev.slice(-5), `${emoji} ${toolName} 出错: ${error}`]);
+                    },
+                    onToolFeedback: (content) => {
+                      if (content) {
+                        setExecutionSummary(prev => [...prev.slice(-5), content]);
+                      }
+                    },
+                    onBudgetWarning: (content) => {
+                      if (content) {
+                        setExecutionSummary(prev => [...prev.slice(-5), content]);
+                      }
+                    },
+                    onThinkingDelta: (content) => {
+                      setMessages(prev => prev.map(m =>
+                        m.id === aid ? { ...m, thinking: (m.thinking || '') + content } : m
+                      ));
+                    },
+                    onThinkingDone: () => {},
+                    onAsk: (question, choices, question_id) => {
+                      setWaitingQuestion({ question, choices, id: question_id });
+                      setWaitingAnswer('');
+                    },
+                  }, waitingQuestion.id, choice);
+                }}
+              />
+            ))}
+          </div>
+          {waitingQuestion.choices.length === 0 && (
+            <div className="chat-clarify-input">
+              <input
+                type="text"
+                name="clarify-answer"
+                value={waitingAnswer}
+                onChange={(e) => setWaitingAnswer(e.target.value)}
+                onKeyDown={async (e) => {
+                  e.stopPropagation();
+                  if (e.key === 'Enter' && waitingAnswer.trim()) {
+                    const answer = waitingAnswer.trim();
+                    await submitClarifyAnswer(waitingQuestion.id, answer, currentSessionId || undefined);
+                    setWaitingQuestion(null);
+                    setWaitingAnswer('');
+                    // 续流逻辑同上
+                    setIsLoading(true);
+                    setIsStreaming(true);
+                    setExecutionSummary([]);
+                    setStepHistory([]);
+                    const uid = generateMessageId();
+                    const aid = generateMessageId();
+                    setMessages(prev => [...prev,
+                      { id: uid, role: 'user', content: answer, timestamp: Date.now(), status: 'completed' as const },
+                      { id: aid, role: 'assistant', content: '', timestamp: Date.now(), status: 'streaming' as const },
+                    ]);
+                    abortRef.current = streamChat(answer, currentSessionId || undefined, true, {
+                      onStart: () => { setIsStreaming(true); setProgressText('继续中...'); },
+                      onProgress: (content) => setProgressText(content),
+                      onToolStart: (toolName, _args, emoji) => { setToolElapsed(0); setCurrentTool({ name: toolName, emoji, startTime: Date.now() }); },
+                      onToolComplete: (toolName, preview, duration, emoji) => {
+                        setCurrentTool(null);
+                        if (preview) {
+                          setExecutionSummary(prev => [...prev.slice(-5), `${emoji} ${toolName} (${duration.toFixed(1)}s): ${preview}`]);
+                        }
+                      },
+                      onToolError: (toolName, error, emoji) => {
+                        setCurrentTool(null);
+                        setExecutionSummary(prev => [...prev.slice(-5), `${emoji} ${toolName} 出错: ${error}`]);
+                      },
+                      onToolFeedback: (content) => {
+                        if (content) {
+                          setExecutionSummary(prev => [...prev.slice(-5), content]);
+                        }
+                      },
+                      onBudgetWarning: (content) => {
+                        if (content) {
+                          setExecutionSummary(prev => [...prev.slice(-5), content]);
+                        }
+                      },
+                      onThinkingDelta: (content) => { setMessages(prev => prev.map(m => m.id === aid ? { ...m, thinking: (m.thinking || '') + content } : m)); },
+                      onThinkingDone: () => {},
+                      onAsk: (question, choices, question_id) => { setWaitingQuestion({ question, choices, id: question_id }); setWaitingAnswer(''); },
+                      onContent: (_chunk, full) => {
+                        setProgressText('');
+                        const thinkMatch = full.match(/<think>([\s\S]*?)晖/);
+                        const thinking = thinkMatch ? thinkMatch[1] : '';
+                        const displayContent = full.replace(/<think>[\s\S]*?晖/g, '').trim();
+                        setMessages(prev => prev.map(m => m.id === aid ? { ...m, content: displayContent, thinking: thinking || m.thinking, status: 'streaming' as const } : m));
+                      },
+                      onDone: () => {
+                        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+                        setProgressText('');
+                        setStepHistory([]);
+                        setMessages(prev => prev.map(m =>
+                          m.id === aid ? { ...m, status: 'completed' as const } : m
+                        ));
+                        setIsStreaming(false);
+                        setIsLoading(false);
+                        setCurrentTool(null);
+                        abortRef.current = null;
+                      },
+                      onError: (err) => {
+                        if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+                        setProgressText('');
+                        setStepHistory([]);
+                        setErrorMessage(err);
+                        setMessages(prev => prev.map(m =>
+                          m.id === aid ? { ...m, status: 'error' as const, error: err } : m
+                        ));
+                        setIsStreaming(false);
+                        setIsLoading(false);
+                        setCurrentTool(null);
+                        abortRef.current = null;
+                      },
+                    });
+                  }
+                }}
+                placeholder="输入你的回答后按 Enter..."
+                autoFocus
+              />
+            </div>
+          )}
         </div>
       )}
 

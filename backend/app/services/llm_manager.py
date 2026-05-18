@@ -58,7 +58,7 @@ class LLMManager:
         # 绑定后将当前 LLM 同步过去（确保 try_restore_saved_provider 恢复的 LLM 生效）
         if self._current_llm is not None:
             self._sync_to_agent()
-        logger.info("LLMManager 已绑定 AgentEngine")
+        logger.info(f"LLMManager 已绑定 AgentEngine，_current_llm={type(self._current_llm).__name__ if self._current_llm else None}")
 
     def _seed_initial_llm(self, llm: BaseLLM, provider: str) -> None:
         """在启动时注入已有的 LLM 实例（避免重复创建）"""
@@ -90,11 +90,16 @@ class LLMManager:
                         if entry.get("provider") == saved_provider and entry.get("model") == saved_model:
                             saved_endpoint = entry.get("api_endpoint")
                             break
-        except Exception:
+        except Exception as e:
+            logger.warning(f"读取保存的配置失败: {e}")
             return False
 
-        if not saved_provider or saved_provider == self._current_provider:
+        if not saved_provider:
+            logger.info("没有保存的 provider")
             return False
+        if saved_provider == self._current_provider and self._current_llm is not None:
+            logger.info(f"保存的 provider 与当前相同且 LLM 已存在，跳过重复恢复: {saved_provider}")
+            return True  # 视为恢复成功，无需重建 LLM
 
         api_key = self.get_api_key(saved_provider)
         if not api_key:

@@ -1,5 +1,5 @@
-from pydantic_settings import BaseSettings
-from typing import Optional
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Any, Dict, Optional
 
 
 class Settings(BaseSettings):
@@ -46,8 +46,18 @@ class Settings(BaseSettings):
     nudge_memory_interval: int = 10
     nudge_skill_interval: int = 10
 
-    class Config:
-        env_file = ".env"
+    # MCP 服务器配置
+    # mcp_servers:
+    #   filesystem:
+    #     command: "npx"
+    #     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+    #     env: {}
+    mcp_servers: Dict[str, Dict[str, Any]] = {}
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+    )
 
 
 settings = Settings()

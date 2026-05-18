@@ -11,11 +11,9 @@ SkillFileManager - 技能平文件管理器 (Hermes 风格)
 import os
 import re
 import yaml
-import json
 import logging
 import shutil
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -264,9 +262,9 @@ class SkillFileManager:
             if os.path.isdir(skill_dir):
                 return skill_dir
             # 同名搜索
-            for d in self._get_skill_dirs(category_dir):
-                if os.path.basename(d) == self._sanitize_name(name):
-                    return d
+            for candidate_dir in self._get_skill_dirs(category_dir):
+                if os.path.basename(candidate_dir) == self._sanitize_name(name):
+                    return candidate_dir
         return None
 
     def _read_frontmatter(self, path: str) -> Dict:
@@ -300,7 +298,8 @@ class SkillFileManager:
         return None
 
     def _sanitize_name(self, name: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9_-]", "-", name.lower()).strip("-") or "unnamed"
+        # 保留 Unicode 字符（中文、日文等），只替换危险字符
+        return re.sub(r"[^a-zA-Z0-9_\-一-鿿]", "-", name.lower()).strip("-") or "unnamed"
 
     def _read_text(self, path: str) -> str:
         try:

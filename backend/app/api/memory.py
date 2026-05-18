@@ -47,12 +47,12 @@ def get_agent() -> AgentEngine:
 @router.post("/create")
 async def create_session(request: CreateSessionRequest, engine: AgentEngine = Depends(get_agent)):
     session = await engine.create_session(request.name)
-    return {"session": session.dict()}
+    return {"session": session.model_dump()}
 
 @router.get("/sessions")
 async def get_sessions(engine: AgentEngine = Depends(get_agent)):
     sessions = await engine.get_sessions()
-    return {"sessions": [s.dict() for s in sessions]}
+    return {"sessions": [s.model_dump() for s in sessions]}
 
 @router.put("/session/{session_id}")
 async def update_session(session_id: str, request: UpdateSessionRequest, engine: AgentEngine = Depends(get_agent)):
@@ -68,7 +68,7 @@ async def update_session(session_id: str, request: UpdateSessionRequest, engine:
     session = await engine.update_session(session_id, request.name)
     if not session:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return {"session": session.dict()}
+    return {"session": session.model_dump()}
 
 @router.get("/messages/{session_id}")
 async def get_session_messages(session_id: str, engine: AgentEngine = Depends(get_agent)):
@@ -240,17 +240,17 @@ async def clear_session_messages(session_id: str, engine: AgentEngine = Depends(
 @router.get("/{session_id}")
 async def get_session_memories(session_id: str, engine: AgentEngine = Depends(get_agent)):
     memories = await engine.get_session_memories(session_id)
-    return {"memories": [m.dict() for m in memories]}
+    return {"memories": [m.model_dump() for m in memories]}
 
 @router.post("/search")
 async def search_memories(request: SearchRequest, engine: AgentEngine = Depends(get_agent)):
     memories = await engine.search_memories(request.query, request.k, request.session_id)
-    return {"results": [m.dict() for m in memories]}
+    return {"results": [m.model_dump() for m in memories]}
 
 @router.post("/add")
 async def add_memory(request: AddMemoryRequest, engine: AgentEngine = Depends(get_agent)):
     memory = await engine.add_memory(request.type, request.content, request.importance, request.session_id)
-    return {"memory": memory.dict()}
+    return {"memory": memory.model_dump()}
 
 @router.put("/update/{memory_id}")
 async def update_memory(
@@ -261,7 +261,7 @@ async def update_memory(
     updated_memory = await engine.update_memory(memory_id, request.content, request.importance)
     if not updated_memory:
         raise HTTPException(status_code=404, detail="记忆不存在")
-    return {"memory": updated_memory.dict()}
+    return {"memory": updated_memory.model_dump()}
 
 @router.delete("/delete/{memory_id}")
 async def delete_memory(memory_id: str, engine: AgentEngine = Depends(get_agent)):

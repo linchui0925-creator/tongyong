@@ -7,7 +7,7 @@
 export type MessageRole = 'user' | 'assistant' | 'system';
 
 /** 消息状态枚举 */
-export type MessageStatus = 'sending' | 'streaming' | 'completed' | 'error';
+export type MessageStatus = 'sending' | 'streaming' | 'completed' | 'error' | 'waiting';
 
 /** 对话消息接口 */
 export interface Message {
@@ -19,6 +19,9 @@ export interface Message {
     error?: string;
     /** 提取的思考过程内容 */
     thinking?: string;
+    toolsUsed?: string[];
+    commandsExecuted?: string[];
+    executionClaimMismatch?: boolean;
 }
 
 /** 会话信息接口 */
@@ -49,7 +52,8 @@ export interface ChatResponse {
 
 /** 流式事件类型 */
 export type StreamEventType = 'start' | 'content' | 'done' | 'error' | 'progress'
-    | 'tool_start' | 'tool_complete' | 'tool_error' | 'tool_feedback';
+    | 'tool_start' | 'tool_complete' | 'tool_error' | 'tool_feedback'
+    | 'thinking_delta' | 'thinking_done' | 'ask' | 'budget_warning';
 
 /** 工具事件数据 */
 export interface ToolEvent {
@@ -80,6 +84,15 @@ export interface StreamEvent {
     arguments?: Record<string, any>;
     result_preview?: string;
     duration?: number;
+    choices?: string[];
+    question?: string;
+    question_id?: string;
+    /** Token 使用量 */
+    usage?: {
+        input_tokens?: number;
+        output_tokens?: number;
+        total_tokens?: number;
+    };
 }
 
 /** SSE事件源 */
@@ -97,10 +110,16 @@ export interface SSECallbacks {
     onToolError?: (toolName: string, error: string, emoji: string) => void;
     /** 工具执行反馈（如已调用工具列表） */
     onToolFeedback?: (content: string) => void;
+    /** 预算警告或阶段性告警 */
+    onBudgetWarning?: (content: string) => void;
     /** 思考过程增量 */
     onThinkingDelta?: (content: string) => void;
     /** 思考过程完成 */
     onThinkingDone?: () => void;
+    /** 等待用户交互式回答 */
+    onAsk?: (question: string, choices: string[], question_id: string) => void;
+    /** Token 使用量更新（实时） */
+    onUsage?: (inputTokens: number, outputTokens: number, totalTokens: number) => void;
 }
 
 /** UI主题配置 */

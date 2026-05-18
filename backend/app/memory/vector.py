@@ -30,10 +30,10 @@ class VectorStore:
     def __init__(self, persist_directory: str = "./data/chroma"):
         self.persist_directory = persist_directory
         os.makedirs(persist_directory, exist_ok=True)
+        self.client = None
+        self.collection = None
 
         if not _ensure_chromadb_imported():
-            self.client = None
-            self.collection = None
             logger.warning("chromadb不可用，向量库已降级为禁用状态")
             return
 
@@ -45,10 +45,16 @@ class VectorStore:
         except TypeError:
             settings = Settings()
 
-        self.client = chromadb.PersistentClient(
-            path=persist_directory,
-            settings=settings
-        )
+        try:
+            self.client = chromadb.PersistentClient(
+                path=persist_directory,
+                settings=settings
+            )
+        except BaseException as e:
+            logger.error(f"初始化 ChromaDB 失败，向量库降级为禁用状态: {e}")
+            self.client = None
+            self.collection = None
+            return
         
         self._init_collection()
         
@@ -68,13 +74,23 @@ class VectorStore:
                 cursor = conn.cursor()
                 cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='collections'")
                 row = cursor.fetchone()
-                if row and 'topic' not in row[0]:
-                    cursor.execute("ALTER TABLE collections ADD COLUMN topic TEXT")
-                    conn.commit()
-                    logger.info("已自动修复 ChromaDB schema: 添加 topic 列")
+                if row:
+                    # 修复缺失的 topic 列
+                    if 'topic' not in row[0]:
+                        cursor.execute("ALTER TABLE collections ADD COLUMN topic TEXT")
+                        conn.commit()
+                        logger.info("已自动修复 ChromaDB schema: 添加 topic 列")
+                    # 修复缺失的 embedding_dim 列（如果有）
+                    if 'embedding_dim' not in row[0]:
+                        try:
+                            cursor.execute("ALTER TABLE collections ADD COLUMN embedding_dim INTEGER")
+                            conn.commit()
+                            logger.info("已自动修复 ChromaDB schema: 添加 embedding_dim 列")
+                        except Exception as e:
+                            logger.debug(f"embedding_dim 列添加失败（可能已存在）: {e}")
                 conn.close()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"ChromaDB schema 修复失败: {e}")
 
         try:
             self.collection = self.client.get_collection(name="memories")

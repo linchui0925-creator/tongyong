@@ -83,7 +83,8 @@ class DomainIntegrator:
             "memory": ["记忆", "梦境", "反思", "忘记", "还记得", "长期", "nudge", "回忆"],
             "cron": ["定时", "调度", "计划", "周期", "每天", "cron", "scheduler", "定期"],
             "tools": ["工具", "执行", "创建", "删除", "修改", "分析", "查看",
-                      "浏览器", "网页", "截图", "screenshot", "页面", "网址"],
+                      "浏览器", "网页", "截图", "screenshot", "页面", "网址",
+                      "skill", "技能", "工作流", "流程", "上传 skill"],
         }
         keywords = builtin_keywords.get(domain_key, [domain_key])
         for f in files:

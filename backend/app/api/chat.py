@@ -4,7 +4,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List
 from app.llm.base import LLMError
 import logging
@@ -20,8 +20,9 @@ class ChatRequest(BaseModel):
     session_id: Optional[str] = Field(None, description="会话ID")
     use_memory: bool = Field(True, description="是否使用记忆功能")
     
-    @validator('message')
-    def validate_message(cls, v):
+    @field_validator("message")
+    @classmethod
+    def validate_message(cls, v: str) -> str:
         """验证消息内容"""
         if not v or not v.strip():
             raise ValueError('消息内容不能为空')

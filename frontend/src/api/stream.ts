@@ -30,6 +30,12 @@ function parseEventData(event: MessageEvent): StreamEvent | null {
             arguments: data.arguments,
             result_preview: data.result_preview,
             duration: data.duration,
+            choices: data.choices,
+            question: data.question,
+            question_id: data.question_id,
+            commands_executed: data.commands_executed,
+            processing_time: data.processing_time,
+            usage: data.usage,
         };
     } catch (error) {
         console.error('解析SSE事件数据失败:', error);
@@ -64,7 +70,9 @@ export function streamChat(
     message: string,
     sessionId?: string,
     useMemory: boolean = true,
-    callbacks: SSECallbacks = {}
+    callbacks: SSECallbacks = {},
+    clarifyQuestionId?: string,
+    clarifyAnswer?: string
 ): AbortController {
     const controller = new AbortController();
 
@@ -83,7 +91,9 @@ export function streamChat(
     const requestData = {
         message: message.trim(),
         session_id: sessionId || undefined,
-        use_memory: useMemory
+        use_memory: useMemory,
+        clarify_question_id: clarifyQuestionId || undefined,
+        clarify_answer: clarifyAnswer || undefined
     };
 
     console.log('[流式聊天请求]', requestData);
@@ -196,6 +206,9 @@ function handleStreamEvent(
 
         case 'tool_complete':
             callbacks.onToolComplete?.(event.tool_name || '', event.result_preview || '', event.duration || 0, event.emoji || '⚡');
+            if (event.result_preview) {
+                callbacks.onProgress?.(`${event.emoji || '⚡'} ${event.tool_name || ''} 完成: ${event.result_preview}`);
+            }
             break;
 
         case 'tool_error':
@@ -206,12 +219,33 @@ function handleStreamEvent(
             callbacks.onToolFeedback?.(event.content || '');
             break;
 
+        case 'budget_warning':
+            callbacks.onBudgetWarning?.(event.content || '');
+            callbacks.onProgress?.(event.content || '');
+            break;
+
+        case 'usage':
+            // 实时 token 使用量
+            if (event.usage) {
+                const { input_tokens = 0, output_tokens = 0, total_tokens = 0 } = event.usage;
+                callbacks.onUsage?.(input_tokens, output_tokens, total_tokens);
+            }
+            break;
+
         case 'thinking_delta':
             callbacks.onThinkingDelta?.(event.content || '');
             break;
 
         case 'thinking_done':
             callbacks.onThinkingDone?.();
+            break;
+
+        case 'ask':
+            callbacks.onAsk?.(
+                event.question || '',
+                event.choices || [],
+                event.question_id || ''
+            );
             break;
 
         case 'content':
@@ -221,6 +255,11 @@ function handleStreamEvent(
 
         case 'done':
             console.log('[流式完成]', event);
+            // 最终 token 统计
+            if (event.usage) {
+                const { input_tokens = 0, output_tokens = 0, total_tokens = 0 } = event.usage;
+                callbacks.onUsage?.(input_tokens, output_tokens, total_tokens);
+            }
             callbacks.onDone?.(event);
             break;
 
@@ -253,4 +292,3 @@ export async function testStreamEndpoint(): Promise<boolean> {
 export function generateMessageId(): string {
     return `msg_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 }
-

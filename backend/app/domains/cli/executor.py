@@ -12,7 +12,7 @@ import re
 from typing import Dict, Any, List, Optional
 
 from app.domains.base import BaseDomainExecutor
-from app.tools.implementations.terminal import _ALLOWED_COMMANDS, _FORBIDDEN_PATTERNS
+from app.tools.security_config import _ALLOWED_COMMANDS, _FORBIDDEN_PATTERNS
 
 logger = logging.getLogger(__name__)
 

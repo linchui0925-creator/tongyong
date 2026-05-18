@@ -1,38 +1,34 @@
 """
 env_capabilities - 运行时环境能力检测
 
-启动时检测实际安装了哪些工具/依赖，注入到 system prompt，
-让 Agent 知道自己的真实环境能力，而不是靠静态文本。
+双轨架构：
+- 工具描述：通过 API `tools` 参数传递（来自 registry.get_schemas()）
+- 工具索引：system prompt 里只说"读 tools.md"
+- Skills 索引：在 system prompt 文本里（见 skills_index.py）
 """
 
 import logging
 import shutil
 import subprocess
 import sys
-from typing import Dict, Any
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional
 from functools import lru_cache
 
 logger = logging.getLogger(__name__)
 
+# ── 环境检测 ────────────────────────────────────────────────────────────────
 
 def _check_package(package: str) -> str | None:
-    """检查 Python 包是否安装，返回版本号"""
     try:
         import importlib.metadata
         return importlib.metadata.version(package)
-    except importlib.metadata.PackageNotFoundError:
-        # fallback
-        try:
-            __import__(package.replace("-", "_"))
-            return "installed"
-        except ImportError:
-            return None
     except Exception:
         return None
 
 
 def _check_cli(name: str) -> str | None:
-    """检查 CLI 工具是否存在，返回版本信息"""
     path = shutil.which(name)
     if not path:
         return None
@@ -46,91 +42,91 @@ def _check_cli(name: str) -> str | None:
         return path
 
 
-def _check_playwright_browsers() -> list[str]:
-    """检查 Playwright 已安装哪些浏览器"""
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--dry-run"],
-            capture_output=True, text=True, timeout=10,
-        )
-        browsers = []
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("browser:"):
-                name = line.split("browser:")[1].strip().split()[0]
-                if name not in browsers:
-                    browsers.append(name)
-        return browsers
-    except Exception:
-        return []
-
-
 @lru_cache(maxsize=1)
 def detect() -> Dict[str, Any]:
-    """检测环境能力，结果缓存避免重复执行"""
     result: Dict[str, Any] = {
         "python": sys.version.split()[0],
         "packages": {},
         "cli_tools": {},
     }
-
-    # Python 包检测
     for pkg in ["playwright", "httpx", "chromadb"]:
         ver = _check_package(pkg)
         if ver:
             result["packages"][pkg] = ver
-
-    # 如果 playwright 装了，检测浏览器
-    if "playwright" in result["packages"]:
-        browsers = _check_playwright_browsers()
-        if browsers:
-            result["playwright_browsers"] = browsers
-
-    # CLI 工具检测
     for cmd in ["git", "node", "npm", "curl", "docker", "sqlite3"]:
         ver = _check_cli(cmd)
         if ver:
             result["cli_tools"][cmd] = ver
-
     return result
 
 
-def format_env_prompt() -> str:
-    """将环境能力格式化为 system prompt 文本"""
+def _format_env_detection() -> str:
+    """当前环境信息（Python 版本、已安装包、CLI 工具）"""
     env = detect()
-    lines = ["## 当前环境能力（自动检测）\n"]
-
+    lines = ["## 当前环境\n"]
     lines.append(f"- Python {env['python']}")
-
     for pkg, ver in env.get("packages", {}).items():
         lines.append(f"- {pkg}=={ver}")
-
-    browsers = env.get("playwright_browsers", [])
-    if browsers:
-        lines.append(f"- Playwright 浏览器: {', '.join(browsers)}")
-        lines.append("  你可以使用 browser 工具打开网页、截图、点击元素等。")
-
     for cmd, ver in env.get("cli_tools", {}).items():
         short = ver.split("\n")[0] if "\n" in ver else ver
         lines.append(f"- {cmd}: {short}")
+    return "\n".join(lines)
 
-    if not browsers:
-        lines.append("")
+
+# ── 工具索引（双轨：不在 system prompt 里放工具描述）──────────────
+
+# 工具集标签
+_TOOLSET_LABELS = {
+    "file": "📁 文件",
+    "terminal": "💻 终端",
+    "browser": "🌐 浏览器",
+    "web": "🔍 网络",
+    "desktop": "🖥️ 桌面",
+    "android": "📱 Android",
+    "interactive": "❓ 交互",
+    "skill": "🎯 Skill",
+}
+
+
+def generate_capability_prompt() -> str:
+    """工具集索引（双轨风格：不在这里放工具描述）
+
+    工具描述通过 API `tools` 参数传递。
+    Agent 想知道详细描述时，用 read_file('domains/tools/tools.md') 读取。
+    """
+    lines = ["## 可用工具集\n"]
+    lines.append(
+        "**工具描述通过 API 的 `tools` 参数传递，Agent 推理时自动看到。**\n"
+        "**想查看详细描述时，用 `read_file('domains/tools/tools.md')` 读取。**"
+    )
+
+    try:
+        from app.tools.registry import registry, discover_builtin_tools
+        discover_builtin_tools()
+        toolsets = registry.get_available_toolsets()
+        for ts in sorted(toolsets.keys()):
+            info = toolsets[ts]
+            label = _TOOLSET_LABELS.get(ts, f"🔧 {ts}")
+            tools = sorted(info["tools"])
+            available = "✅" if info["available"] else "⚠️ 需要配置"
+            lines.append(f"\n### {label} {available}")
+            lines.append(" " + " | ".join(f"`{t}`" for t in tools))
+    except Exception as e:
+        logger.warning(f"无法从 registry 读取工具集: {e}")
 
     return "\n".join(lines)
 
 
-# 模块加载时预热缓存（不阻塞）
+# ── 公开 API ────────────────────────────────────────────────────────────────
+
 _detected: str | None = None
 
 
 def get_env_prompt() -> str:
-    """获取环境能力提示词（延迟初始化 + 缓存）"""
     global _detected
     if _detected is None:
         try:
-            _detected = format_env_prompt()
-            logger.info(f"环境能力检测完成")
+            _detected = _format_env_detection()
         except Exception as e:
             logger.warning(f"环境能力检测失败: {e}")
             _detected = ""
@@ -138,7 +134,6 @@ def get_env_prompt() -> str:
 
 
 def refresh():
-    """强制重新检测（例如安装新包后）"""
     global _detected
     detect.cache_clear()
     _detected = None

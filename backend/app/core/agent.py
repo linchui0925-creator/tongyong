@@ -3,6 +3,7 @@ from datetime import datetime
 import asyncio
 from app.core.base import Message, Session, Memory
 from app.core.context import ContextManager
+from app.core.context_compressor import ContextCompressor
 from app.core.iteration_budget import IterationBudget
 from app.memory.storage import MemoryStorage
 from app.memory.vector import VectorStore
@@ -10,8 +11,74 @@ from app.llm.base import LLMResponse
 from app.tools.registry import registry as _tool_registry
 import re
 import logging
+import uuid
 
 logger = logging.getLogger(__name__)
+
+
+# ── 模块级工具函数（供 chat() 和 stream_chat() 共用）────────────────────────────
+
+def _has_execution_claim(text: str) -> bool:
+    """检测模型是否声称已经执行了外部动作。"""
+    if not text:
+        return False
+    patterns = [
+        # 已完成时 - 声称已经做了
+        r"已(?:经)?(?:调用|执行|运行|打开|访问|搜索|读取|写入|修改|创建|删除|安装|启动|截图|导航)",
+        r"我(?:已|已经)(?:调用|执行|运行|打开|访问|搜索|读取|写入|修改|创建|删除|安装|启动|截图|导航)",
+        r"(?:调用|执行|运行|打开|访问|搜索|读取|写入|修改|创建|删除|安装|启动|截图|导航).{0,12}(?:完成|成功|完毕)",
+        r"(?:successfully|have|has)\s+(?:called|executed|run|opened|visited|searched|read|wrote|modified|created|deleted|installed|started)",
+        # 将来时 - 声称要做什么（但实际还没做）
+        r"让我(?:看看|搜索|查找|分析|执行|运行|检查|查看)",
+        r"让我来(?:看看|搜索|查找|分析|执行|运行|检查|查看)",
+        r"我来(?:看看|搜索|查找|分析|执行|运行|检查|查看)",
+        r"我(?:将|要)去?(?:看看|搜索|查找|分析|执行|运行|检查|查看)",
+        r"我(?:将|要)(?:调用|执行|运行|打开|访问|搜索|读取|写入|修改|创建|删除|安装|启动)",
+        r"(?:let me|i'll|i am going to|i will)\s+(?:search|find|look|check|execute|run|read|write|open|visit|analyze)",
+        r"(?:现在|马上|这就去)(?:搜索|查找|分析|执行|运行|检查)",
+    ]
+    return any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in patterns)
+
+
+def _is_error_result(result: str) -> bool:
+    """检测工具返回结果是否为错误。"""
+    if result.startswith("工具执行失败"):
+        return True
+    lower = result.lower()
+    if "超时" in result or "timeout" in lower or "timed out" in lower:
+        return True
+    if "不在允许列表中" in result or "请使用 browser 工具" in result:
+        return True
+    if "executable doesn't exist" in lower or "please run the following command to download new browsers" in lower:
+        return True
+    if "error" in lower or "错误" in result or "失败" in result:
+        return True
+    return False
+
+
+def _classify_error_type(error_msg: str) -> str:
+    """将错误信息分类为语义类型。"""
+    msg = error_msg.lower()
+    if "permission" in msg or "权限" in error_msg or "denied" in msg or "拒绝" in error_msg:
+        return "permission"
+    elif "executable doesn't exist" in msg or "playwright install" in msg or "浏览器未安装" in error_msg:
+        return "environment_missing"
+    elif "timeout" in msg or "超时" in error_msg or "timed out" in msg:
+        return "timeout"
+    elif "invalid" in msg or "参数" in error_msg or "格式" in error_msg:
+        return "invalid_args"
+    return "generic"
+
+
+def _validate_execution_claim(text: str, tools_used: list, commands_executed: list) -> Tuple[bool, Optional[str]]:
+    """最终输出硬校验：声明执行必须有本轮工具证据。"""
+    if _has_execution_claim(text) and not tools_used and not commands_executed:
+        return False, (
+            "你刚才的回复声称已经执行了任务，但本轮没有任何真实工具调用记录。"
+            "禁止把计划、意图或文字描述当成执行结果。"
+            "下一轮必须二选一：实际调用合适的工具；或明确说明尚未执行。"
+        )
+    return True, None
 
 
 class AgentEngine:
@@ -21,6 +88,42 @@ class AgentEngine:
         self.memory_storage = MemoryStorage()
         self.vector_store = VectorStore()
         self._cli_executor = None  # 延迟初始化
+        # ask 交互状态 {question_id: {"question": ..., "choices": ..., "user_response": None}}
+        self._ask_pending: Dict[str, dict] = {}
+        # 约束引擎：防止 agent 幻觉式自我欺骗
+        # 延迟导入，模块不存在时降级为无约束模式
+        self._constraint_engine = None
+        try:
+            from app.hermes.constraint import HermesConstraintEngine
+            self._constraint_engine = HermesConstraintEngine()
+            logger.info("ConstraintEngine 已加载")
+        except ImportError:
+            logger.warning("ConstraintEngine 未找到，约束验证已禁用")
+
+        # Context Compressor — 自动压缩长对话
+        # 默认 50% threshold，保护前 3 条 + 后 20 条
+        self.context_compressor = ContextCompressor(
+            context_length=128000,
+            threshold_percent=0.50,
+            protect_first_n=3,
+            protect_last_n=20,
+        )
+
+    def set_ask_response(self, question_id: str, answer: str) -> bool:
+        """存储用户对某个 ask 问题的回答"""
+        if question_id in self._ask_pending:
+            self._ask_pending[question_id]["user_response"] = answer
+            logger.info(f"[ask] 回答已记录: question_id={question_id}")
+            return True
+        logger.warning(f"[ask] 问题不存在或已过期: question_id={question_id}")
+        return False
+
+    def get_ask_response(self, question_id: str) -> Optional[str]:
+        """获取某个 ask 问题的用户回答"""
+        entry = self._ask_pending.get(question_id)
+        if entry:
+            return entry.get("user_response")
+        return None
 
     def _get_cli_executor(self):
         """获取 CLI 执行器（延迟初始化）"""
@@ -32,6 +135,26 @@ class AgentEngine:
             except Exception as e:
                 logger.warning(f"CLIExecutor 初始化失败: {e}")
         return self._cli_executor
+
+    def _try_fallback_llm(self):
+        """尝试获取 fallback LLM（当主 provider 失败时）"""
+        try:
+            from app.services.llm_manager import LLMManager
+            llm_mgr = LLMManager()
+            available = ["openai", "anthropic", "deepseek", "google"]
+            for provider in available:
+                if provider == getattr(self.llm, 'provider', None):
+                    continue
+                api_key = llm_mgr.get_api_key(provider)
+                if api_key:
+                    from app.llm.factory import get_llm
+                    fallback_llm = get_llm(provider, api_key)
+                    if fallback_llm:
+                        logger.info(f"找到 fallback LLM: {provider}")
+                        return fallback_llm
+        except Exception as e:
+            logger.warning(f"获取 fallback LLM 失败: {e}")
+        return None
 
     async def _ensure_domain_prompts(self, session_id: str):
         """注入身份与能力认知提示词（每次对话都注入，覆盖 LLM 默认自我认知）"""
@@ -49,8 +172,8 @@ class AgentEngine:
         except Exception as e:
             logger.warning(f"领域认知注入失败: {e}")
 
-    async def _inject_hermes_memory(self, session_id: str):
-        """注入 Hermes 平文件记忆内容（MEMORY.md / USER.md）"""
+    async def _inject_memory(self, session_id: str):
+        """注入平文件记忆内容（MEMORY.md / USER.md）"""
         try:
             from app.hermes.memory_file import MemoryFileManager
             mfm = MemoryFileManager(base_dir="./data/hermes")
@@ -71,7 +194,7 @@ class AgentEngine:
                 ))
                 logger.info("注入 USER.md 用户画像")
         except Exception as e:
-            logger.debug(f"Hermes 记忆注入跳过: {e}")
+            logger.debug(f"平文件记忆注入跳过: {e}")
 
     async def _get_or_create_session(self) -> str:
         sessions = await self.memory_storage.get_sessions()
@@ -99,19 +222,6 @@ class AgentEngine:
         except Exception as e:
             logger.warning(f"加载操作习惯失败: {e}")
 
-    async def _try_execute_from_response(self, text: str) -> Optional[Tuple[str, str]]:
-        """从 LLM 回复中检测并执行命令"""
-        executor = self._get_cli_executor()
-        if not executor:
-            return None
-        command = executor.extract_from_response(text)
-        if not command:
-            return None
-        logger.info(f"检测到命令: {command}")
-        result = await executor.execute("run", {"command": command})
-        formatted = executor.format_result(result)
-        return command, formatted
-
     async def chat(
         self,
         session_id: Optional[str],
@@ -122,8 +232,8 @@ class AgentEngine:
             session_id = await self._get_or_create_session()
             logger.info(f"创建新会话: {session_id}")
 
-        # 注入身份认知和 Hermes 记忆（放在上下文最前面，覆盖 LLM 默认认知）
-        await self._inject_hermes_memory(session_id)
+        # 注入身份认知和记忆（放在上下文最前面，覆盖 LLM 默认认知）
+        await self._inject_memory(session_id)
         await self._ensure_domain_prompts(session_id)
 
         # 注入环境能力（让 Agent 知道实际安装了哪些工具）
@@ -136,6 +246,16 @@ class AgentEngine:
         historical_messages = await self.memory_storage.get_messages(session_id)
         for msg in historical_messages:
             self.context.add_message(msg.role, msg.content)
+
+        # ── Preflight Context Compression ──
+        # 如果历史消息 token 数已经超过 50% threshold，在循环开始前先压缩
+        if self.llm and self.context_compressor.should_compress(self.context.get_messages()):
+            logger.info("chat() preflight: 上下文过长，触发压缩")
+            compressed, _ = await self.context_compressor.compress(
+                self.context.get_messages(), self.llm
+            )
+            self.context.messages = compressed
+            self.context._token_estimate = None  # 清除缓存，否则 get_messages() 会重复压缩
 
         self.context.add_message("user", message)
 
@@ -156,7 +276,7 @@ class AgentEngine:
         response = "智能体已收到消息"
         tools_used = []
         commands_executed = []
-        MAX_TOOL_ROUNDS = 10
+        MAX_TOOL_ROUNDS = 20
 
         if self.llm:
             try:
@@ -236,6 +356,12 @@ class AgentEngine:
                 logger.error(f"LLM调用失败: {e}", exc_info=True)
                 response = "智能体已收到消息"
 
+        # 约束：声称执行了但没有任何工具记录 → 强制说明（chat() 正常执行路径）
+        is_valid, correction = _validate_execution_claim(response, tools_used, commands_executed)
+        if not is_valid:
+            response = (response + f"\n\n[{correction}]").strip()
+            logger.warning(f"chat() 执行声明校验未通过: {correction[:80]}")
+
         # 如果使用了工具，在回复末尾附加执行反馈
         if tools_used:
             unique_tools = list(dict.fromkeys(tools_used))
@@ -273,7 +399,7 @@ class AgentEngine:
         return {
             "reply": response,
             "session_id": session_id,
-            "memory_added": [m.dict() for m in memories],
+            "memory_added": [m.model_dump() for m in memories],
             "tools_used": tools_used,
             "commands_executed": commands_executed,
         }
@@ -282,16 +408,26 @@ class AgentEngine:
         self,
         session_id: Optional[str],
         message: str,
-        use_memory: bool = True
+        use_memory: bool = True,
+        step_callback: Optional[callable] = None,
+        interim_assistant_callback: Optional[callable] = None,
+        memory_manager: Optional[Any] = None,
+        prompt_caching: bool = False,
+        clarify_question_id: Optional[str] = None,
+        clarify_answer: Optional[str] = None,
     ):
         """流式聊天（支持工具调用 + 进度反馈）
 
-        Yields:
-            dict: {"type": "progress", "content": str}  进度事件
-            dict: {"type": "content", "content": str}   文本内容块
-            dict: {"type": "done", ...}                 完成事件
+        Args:
+            step_callback: 每次 API 调用前触发
+            interim_assistant_callback: 流式输出中间思考过程
+            memory_manager: 跨 session 记忆注入
+            clarify_question_id: 续接 clarify 时的问题 ID
+            clarify_answer: 用户对 clarify 问题的回答
+            prompt_caching: 启用 prompt caching（Anthropic/Claude 模型通过 OpenRouter 时）
         """
         import time as _time
+        import re as _re
         start_time = _time.time()
 
         def _progress(text: str):
@@ -330,8 +466,12 @@ class AgentEngine:
             if not success:
                 if error_type == "not_found":
                     suggestion = "可尝试检查路径是否正确，或使用其他工具获取信息"
+                elif error_type == "policy_blocked":
+                    suggestion = "该路径被策略阻止，请停止绕过调用，直接基于当前失败原因回复用户"
                 elif error_type == "permission":
                     suggestion = "请检查权限设置，或尝试其他操作方式"
+                elif error_type == "environment_missing":
+                    suggestion = "运行环境缺少所需浏览器依赖，请停止继续试错，直接告知用户需要先安装或配置环境"
                 elif error_type == "timeout":
                     suggestion = "可尝试减小操作范围或增加超时时间"
                 elif error_type == "invalid_args":
@@ -346,18 +486,57 @@ class AgentEngine:
                 "emoji": emoji,
             }
 
-        def _classify_error_type(error_msg: str) -> str:
-            """根据错误消息分类错误类型"""
-            msg = error_msg.lower()
-            if "not found" in msg or "不存在" in msg or "找不到" in msg:
-                return "not_found"
-            elif "permission" in msg or "权限" in msg or "denied" in msg:
-                return "permission"
-            elif "timeout" in msg or "超时" in msg or "timed out" in msg:
-                return "timeout"
-            elif "invalid" in msg or "参数" in msg or "格式" in msg:
-                return "invalid_args"
-            return "generic"
+        def _format_tool_result_text(name: str, success: bool, result: str, error_msg: str = "", error_type: str = "", suggestion: str = "", tool_call_id: str = "") -> str:
+            """将工具结果格式化为易读的纯文本，包含 tool_call_id 供 MiniMax 等 API 解析"""
+            emoji = _tool_registry.get_emoji(name)
+            if success:
+                # 成功：简洁的结果描述
+                preview = result.strip()[:500]
+                if len(result.strip()) > 500:
+                    preview += "\n...[结果已截断]"
+                content = f"[{emoji} {name}] 执行成功:\n{preview}"
+            else:
+                # 失败：错误描述 + 建议
+                lines = [f"[{emoji} {name}] 执行失败: {error_msg}"]
+                if error_type:
+                    lines.append(f"错误类型: {error_type}")
+                if suggestion:
+                    lines.append(f"建议: {suggestion}")
+                content = "\n".join(lines)
+
+            # 返回包含 tool_call_id 的 JSON 格式，供 MiniMax 等 API 解析
+            return _json.dumps({
+                "tool_call_id": tool_call_id,
+                "content": content
+            }, ensure_ascii=False)
+
+        # _classify_error_type, _is_error_result, _has_execution_claim 已提到模块级
+        # _validate_final_text 改为调用模块级 _validate_execution_claim
+
+        async def _summarize_from_existing_context(reason: str) -> str:
+            """预算耗尽或工具循环停止时，让模型基于已有 tool 结果生成最终文本。"""
+            self.context.add_message(
+                "system",
+                f"{reason}\n"
+                "现在必须停止继续调用工具，只能基于上方真实 tool 消息总结。"
+                "禁止声称执行了没有工具记录的动作；工具失败必须如实说明失败。"
+            )
+            summary_messages = [Message(role=m.role, content=m.content) for m in self.context.get_messages()]
+            try:
+                summary_response = await self.llm.chat(messages=summary_messages, tools=None)
+                # 追踪总结调用 token 使用量
+                if summary_response.usage:
+                    cumulative_usage["input_tokens"] += summary_response.usage.get("input_tokens", 0)
+                    cumulative_usage["output_tokens"] += summary_response.usage.get("output_tokens", 0)
+                    cumulative_usage["total_tokens"] += summary_response.usage.get("total_tokens", 0)
+                cleaned, _thinking = _clean_thinking(summary_response.content or "")
+                is_valid, correction = _validate_execution_claim(cleaned, tools_used, commands_executed)
+                if not is_valid:
+                    return correction or "工具调用已停止，但最终总结与执行记录不一致。"
+                return cleaned or "工具调用已停止，未生成有效总结。"
+            except Exception as exc:
+                logger.warning("预算耗尽总结失败: %s", exc, exc_info=True)
+                return f"工具调用已停止，但生成最终总结失败: {exc}"
 
         def _thinking_delta(text: str):
             return {"type": "thinking_delta", "content": text, "timestamp": _time.time()}
@@ -366,58 +545,133 @@ class AgentEngine:
             return {"type": "thinking_done", "timestamp": _time.time()}
 
         def _done():
-            return {"type": "done", "tools_used": list(dict.fromkeys(tools_used)),
+            return {"type": "done", "session_id": session_id or "",
+                    "tools_used": list(dict.fromkeys(tools_used)),
                     "commands_executed": commands_executed,
-                    "processing_time": round(_time.time() - start_time, 2)}
+                    "processing_time": round(_time.time() - start_time, 2),
+                    "usage": cumulative_usage}
 
         def _tool_feedback(text: str):
             return {"type": "tool_feedback", "content": text, "timestamp": _time.time()}
 
+        def _message_requires_tool_call(user_text: str) -> bool:
+            text = (user_text or "").lower()
+            triggers = [
+                "请使用", "务必调用", "必须调用", "用工具", "调用工具",
+                "playwright", "browser", "打开网页", "访问", "截图",
+                "读取文件", "read_file", "search_files", "terminal"
+            ]
+            return any(token in text for token in triggers)
+
+        def _message_requires_visible_chrome(user_text: str) -> bool:
+            text = (user_text or "").lower()
+            triggers = [
+                "可视化", "可见窗口", "可见浏览器", "真实浏览器", "本地chrome",
+                "本地 chrome", "google浏览器", "google chrome", "chrome浏览器",
+                "用我的浏览器", "用我的 chrome", "在 chrome 里", "在浏览器里",
+            ]
+            return any(token in text for token in triggers)
+
+        def _has_cdp_url(user_text: str) -> bool:
+            text = user_text or ""
+            return "ws://" in text and ("/json" in text or "/devtools/page/" in text)
+
         def _clean_thinking(text: str):
             """清理文本中的 <think>...晖 内容，返回 (清理后文本, thinking内容)"""
-            import re
-            match = re.search(r'<think>([\s\S]*?)晖', text)
+            match = _re.search(r'<think>([\s\S]*?)晖', text)
             if match:
                 thinking = match.group(1)
-                cleaned = re.sub(r'<think>[\s\S]*?晖', '', text, count=1).strip()
+                cleaned = _re.sub(r'<think>[\s\S]*?晖', '', text, count=1).strip()
+                return cleaned, thinking
+            match2 = _re.search(r'<think>([\s\S]*?)</think>', text)
+            if match2:
+                thinking = match2.group(1)
+                cleaned = _re.sub(r'<think>[\s\S]*?</think>', '', text, count=1).strip()
                 return cleaned, thinking
             return text, ""
-            return {"type": "tool_feedback", "content": text, "timestamp": _time.time()}
 
         tools_used = []
         commands_executed = []
-        budget = IterationBudget(max_rounds=10, soft_limit=8, grace_calls=2)
+        ask_triggered = False  # 标记是否触发了 ask 交互
+        final_response_chunks: List[str] = []
+        budget = IterationBudget(max_rounds=20, soft_limit=16, grace_calls=4)
+        must_use_tool = _message_requires_tool_call(message)
+        forced_tool_retry_done = False
+        final_claim_retry_done = False
+        tool_results_for_hermes: List[Tuple[str, str]] = []  # Hermes 循环控制用
 
         def _classify_and_group_tools(tool_calls: list) -> Dict[str, list]:
             """按并行模式分组工具调用"""
             return _tool_registry.classify_tool_calls(tool_calls)
 
-        async def _execute_safe_parallel(tool_calls: list, tool_mgr) -> Dict[str, str]:
-            """并行执行 safe 模式的工具调用"""
+        async def _execute_safe_parallel(tool_calls: list, tool_mgr) -> Dict[str, Tuple[str, float]]:
+            """并行执行 safe 模式的工具调用，返回 {id: (result, elapsed)}"""
             if not tool_calls:
                 return {}
+
+            async def _timed(tool_mgr, name, args):
+                t0 = _time.time()
+                try:
+                    result = await tool_mgr.execute(name, args)
+                except Exception as e:
+                    result = f"工具执行失败: {e}"
+                return result, _time.time() - t0
+
             tasks = [
-                tool_mgr.execute(tc["function"]["name"], _json.loads(tc["function"]["arguments"]))
+                _timed(tool_mgr, tc["function"]["name"], _json.loads(tc["function"]["arguments"]))
                 for tc in tool_calls
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            return {
-                tc["id"]: str(r) if not isinstance(r, Exception) else f"工具执行失败: {r}"
-                for tc, r in zip(tool_calls, results)
-            }
+            out = {}
+            for tc, r in zip(tool_calls, results):
+                if isinstance(r, Exception):
+                    out[tc["id"]] = (str(r), 0.0)
+                else:
+                    out[tc["id"]] = r  # (result_str, elapsed_float)
+            return out
+
+        def _build_ask_events(tool_result: str, tool_args: dict) -> Optional[list]:
+            """检测 tool result 中的 __ASK_BLOCK__: 标记，返回 ask 事件列表"""
+            if not tool_result.startswith("__ASK_BLOCK__:"):
+                return None
+            parts = tool_result.split(":", 1)
+            if len(parts) < 2:
+                return None
+            question_id = parts[1].strip()
+            entry = self._ask_pending.get(question_id)
+            if not entry:
+                logger.warning(f"[ask] 问题不存在: {question_id}")
+                return None
+            question = entry["question"]
+            choices = entry["choices"]
+            logger.info(f"[ask] 检测到 ask 阻塞: question_id={question_id}, question={question[:30]}...")
+            return [
+                {"type": "progress", "content": "等待用户回答...", "timestamp": _time.time()},
+                {"type": "ask", "question": question, "choices": choices, "question_id": question_id, "timestamp": _time.time()},
+            ]
 
         if not session_id:
             session_id = await self._get_or_create_session()
 
+        # ── ask 恢复逻辑：用户回答后重新发请求时，注入回答到 _ask_pending ──
+        if clarify_question_id and clarify_answer:
+            self.set_ask_response(clarify_question_id, clarify_answer)
+            logger.info(f"[ask] 续接回答: question_id={clarify_question_id}, answer={clarify_answer[:30]}...")
+
         # ── 阶段 1: 加载上下文 ──
         yield _progress("加载身份认知...")
-        await self._inject_hermes_memory(session_id)
+        await self._inject_memory(session_id)
         await self._ensure_domain_prompts(session_id)
 
         from app.core.env_capabilities import get_env_prompt
         env_prompt = get_env_prompt()
         if env_prompt:
             self.context.add_message("system", env_prompt)
+
+        from app.core.skills_index import get_skills_prompt
+        skills_prompt = get_skills_prompt()
+        if skills_prompt:
+            self.context.add_message("system", skills_prompt)
 
         yield _progress("加载历史对话...")
         historical_messages = await self.memory_storage.get_messages(session_id)
@@ -426,7 +680,34 @@ class AgentEngine:
 
         self.context.add_message("user", message)
 
-        # ── 阶段 2: 检索记忆 ──
+        if _message_requires_visible_chrome(message) and not _has_cdp_url(message):
+            question_id = str(uuid.uuid4())
+            question = (
+                "你要求使用可视化的本地 Chrome。当前需要先提供 Chrome DevTools 连接地址（cdp_url）。\n"
+                "请先用远程调试模式启动 Chrome，例如：\n"
+                "macOS: /Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+                "--remote-debugging-port=9222 --no-first-run --no-default-browser-check\n"
+                "然后把 ws://localhost:9222/json 发给我。"
+            )
+            self._ask_pending[question_id] = {
+                "question": question,
+                "choices": [],
+                "user_response": None,
+                "timeout": False,
+            }
+            yield _progress("等待用户提供可视化 Chrome 的 CDP 连接地址...")
+            yield {
+                "type": "ask",
+                "question": question,
+                "choices": [],
+                "question_id": question_id,
+                "timestamp": _time.time(),
+            }
+            yield _done()
+            self.context.clear()
+            return
+
+        # ── 阶段 2: 检索记忆 + memory_manager 跨 session 记忆注入 ──
         if use_memory and self.llm:
             yield _progress("检索相关记忆...")
             try:
@@ -440,6 +721,19 @@ class AgentEngine:
                     yield _progress(f"已检索 {len(memories)} 条相关记忆")
             except Exception:
                 pass
+
+        # ── memory_manager: 跨 session 记忆注入 ──
+        if memory_manager:
+            try:
+                relevant_memories = await memory_manager.get_relevant_memories(
+                    message, session_id=session_id, max_count=3
+                )
+                for mem in relevant_memories:
+                    self.context.add_message("system", f"[跨会话记忆] {mem.content}")
+                if relevant_memories:
+                    yield _progress(f"跨 session 注入 {len(relevant_memories)} 条记忆")
+            except Exception as e:
+                logger.warning(f"memory_manager 跨 session 记忆注入失败: {e}")
 
         # ── 阶段 3: LLM 对话（支持工具调用） ──
         if not self.llm:
@@ -456,13 +750,42 @@ class AgentEngine:
             logger.info(f"Agent stream_chat 可用工具: {tool_mgr.list_tools()}")
 
             # ── ReAct 工具调用循环（支持并行 + 预算控制） ──
+            final_claim_retry_done = False  # 约束：防止声称执行但无工具证据
+            cumulative_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}  # Token 使用量追踪
             while True:
                 # 检查预算是否耗尽
                 if budget.is_exhausted:
-                    yield _content(budget.get_exhausted_message())
+                    final_text = await _summarize_from_existing_context(budget.get_exhausted_message())
+                    final_response_chunks.append(final_text)
+                    yield _content(final_text)
                     break
 
+                # ── Preflight Context Compression（循环内执行，在所有系统提示词注入之后）──
+                # 只有在首轮且 token 超过 50% threshold 时才压缩，避免每次循环重复检查
+                if budget.current_round == 0:
+                    total_chars = sum(len(m.content or "") for m in self.context.messages)
+                    estimated_tokens = int(total_chars * 0.25)
+                    if estimated_tokens >= self.context_compressor.threshold_tokens:
+                        yield _progress("📦 上下文过长，正在压缩...")
+                        compressed, summary_text = await self.context_compressor.compress(
+                            self.context.get_messages(), self.llm
+                        )
+                        self.context.messages = compressed
+                        self.context._token_estimate = None
+                        yield _progress(f"📦 压缩完成: {summary_text[:80]}...")
+
                 llm_messages = [Message(role=m.role, content=m.content) for m in self.context.get_messages()]
+
+                # ── step_callback：每次 API 调用前触发 ──
+                if step_callback:
+                    try:
+                        step_callback({
+                            "round": budget.current_round + 1,
+                            "remaining": budget.remaining,
+                            "messages_count": len(llm_messages),
+                        })
+                    except Exception as e:
+                        logger.warning(f"step_callback 执行失败: {e}")
 
                 if budget.current_round == 0:
                     yield _progress("正在思考...")
@@ -475,22 +798,210 @@ class AgentEngine:
                     yield {"type": "budget_warning", "content": warning, "timestamp": _time.time()}
 
                 try:
+                    # ── prompt_caching: 为支持缓存的模型注入缓存提示 ──
+                    if prompt_caching and self.llm:
+                        cached_prompt_marker = "[缓存优化] 核心上下文已缓存，请基于已有信息继续推理"
+                        # 在首轮注入缓存标记
+                        if budget.current_round == 0:
+                            self.context.add_message("system", cached_prompt_marker)
+
                     llm_response = await self.llm.chat(messages=llm_messages, tools=tool_schemas)
+                    # 追踪 token 使用量
+                    if llm_response.usage:
+                        cumulative_usage["input_tokens"] += llm_response.usage.get("input_tokens", 0)
+                        cumulative_usage["output_tokens"] += llm_response.usage.get("output_tokens", 0)
+                        cumulative_usage["total_tokens"] += llm_response.usage.get("total_tokens", 0)
+                    if llm_response.has_thinking:
+                        for chunk in llm_response.thinking:
+                            yield _thinking_delta(chunk)
+                        yield _thinking_done()
                 except Exception as _tool_err:
-                    logger.warning(f"带工具的 LLM 调用失败，降级为无工具请求: {_tool_err}")
-                    llm_response = await self.llm.chat(messages=llm_messages, tools=None)
+                    # LLM API 调用失败，尝试 fallback provider
+                    logger.warning(f"带工具的 LLM 调用失败，尝试 fallback: {_tool_err}")
+                    fallback_llm = self._try_fallback_llm()
+                    if fallback_llm:
+                        try:
+                            llm_response = await fallback_llm.chat(messages=llm_messages, tools=tool_schemas)
+                            # 追踪 fallback token 使用量
+                            if llm_response.usage:
+                                cumulative_usage["input_tokens"] += llm_response.usage.get("input_tokens", 0)
+                                cumulative_usage["output_tokens"] += llm_response.usage.get("output_tokens", 0)
+                                cumulative_usage["total_tokens"] += llm_response.usage.get("total_tokens", 0)
+                            self.llm = fallback_llm  # 切换成功，更新主 LLM
+                            logger.info("LLM fallback 成功，已切换 provider")
+                        except Exception as fallback_err:
+                            logger.error(f"LLM fallback 也失败: {fallback_err}")
+                            llm_response = await self.llm.chat(messages=llm_messages, tools=None)
+                    else:
+                        # 无 fallback，降级为无工具请求
+                        llm_response = await self.llm.chat(messages=llm_messages, tools=None)
+                    # 追踪降级调用 token 使用量
+                    if llm_response.usage:
+                        cumulative_usage["input_tokens"] += llm_response.usage.get("input_tokens", 0)
+                        cumulative_usage["output_tokens"] += llm_response.usage.get("output_tokens", 0)
+                        cumulative_usage["total_tokens"] += llm_response.usage.get("total_tokens", 0)
                     full_text = llm_response.content
                     if full_text:
-                        cleaned, _ = _clean_thinking(full_text)
-                        yield _content(cleaned)
+                        cleaned, thinking = _clean_thinking(full_text)
+                        # 检测 __ASK_BLOCK__: 标记（LLM 降级路径的 fallback）
+                        ask_match = _re.search(r'__ASK_BLOCK__:([a-f0-9\-]+)', full_text)
+                        if ask_match:
+                            question_id = ask_match.group(1)
+                            entry = self._ask_pending.get(question_id)
+                            if entry:
+                                question = entry["question"]
+                                choices = entry["choices"]
+                            else:
+                                question = "请回答以下问题"
+                                choices = []
+                            yield _progress("等待用户回答...")
+                            yield {"type": "ask", "question": question, "choices": choices, "question_id": question_id, "timestamp": _time.time()}
+                            break
+                        executor = self._get_cli_executor()
+                        cmd = executor.extract_from_response(full_text) if executor else None
+                        if cmd:
+                            _t0 = _time.time()
+                            yield _tool_start("terminal", {"command": cmd})
+                            try:
+                                result = await tool_mgr.execute("terminal", {"command": cmd})
+                                elapsed = _time.time() - _t0
+                                is_error = _is_error_result(result)
+                                yield _tool_complete("terminal", result, elapsed, error=is_error)
+                                commands_executed.append(cmd)
+                                if self._constraint_engine:
+                                    self._constraint_engine.record_tool_execution(
+                                        tool_name="terminal",
+                                        arguments={"command": cmd},
+                                        result=result,
+                                        success=not is_error,
+                                        timestamp=_time.time()
+                                    )
+                                self.context.add_message("tool", _json.dumps({
+                                    "tool_call_id": "fallback",
+                                    "content": f"[命令执行结果]\n{result}"
+                                }, ensure_ascii=False))
+                                llm_messages2 = [Message(role=m.role, content=m.content) for m in self.context.get_messages()]
+                                llm_response2 = await self.llm.chat(messages=llm_messages2, tools=None)
+                                if llm_response2.content:
+                                    cleaned2, thinking2 = _clean_thinking(llm_response2.content)
+                                    if thinking2:
+                                        yield _thinking_delta(thinking2)
+                                        yield _thinking_done()
+                                    final_response_chunks.append(cleaned2)
+                                    yield _content(cleaned2)
+                            except Exception as _exec_err:
+                                elapsed = _time.time() - _t0
+                                yield _tool_error("terminal", str(_exec_err))
+                        else:
+                            is_valid, correction = _validate_execution_claim(cleaned, tools_used, commands_executed)
+                            if not is_valid and not final_claim_retry_done:
+                                final_claim_retry_done = True
+                                self.context.add_message("assistant", f"[拦截的未执行回复]{cleaned}")
+                                self.context.add_message("system", correction or "回复声称执行但没有工具证据，请纠正。")
+                                continue
+                            if not is_valid:
+                                cleaned = correction or "我还没有实际执行该任务。"
+                            if thinking:
+                                yield _thinking_delta(thinking)
+                                yield _thinking_done()
+                            yield _content(cleaned)
+                            final_response_chunks.append(cleaned)
                     break
 
                 if not llm_response.has_tool_calls:
                     full_text = llm_response.content
+                    if must_use_tool and not forced_tool_retry_done and not tools_used:
+                        # 检查预算是否已耗尽，避免在预算耗尽后继续循环
+                        if budget.is_exhausted:
+                            yield _content(budget.get_exhausted_message())
+                            break
+                        forced_tool_retry_done = True
+                        self.context.add_message(
+                            "system",
+                            "用户这次明确要求必须实际调用工具完成任务。"
+                            "禁止直接基于已有上下文或记忆作答。"
+                            "下一轮必须返回 tool_calls；若工具无法执行，要调用对应工具并把真实错误返回给用户。"
+                        )
+                        if full_text:
+                            self.context.add_message(
+                                "assistant",
+                                f"[拦截的未执行回复]{full_text}"
+                            )
+                        budget.advance()  # 推进预算，即使被拦截
+                        continue
                     if full_text:
-                        cleaned, _ = _clean_thinking(full_text)
+                        cleaned, thinking = _clean_thinking(full_text)
+                        is_valid, correction = _validate_execution_claim(cleaned, tools_used, commands_executed)
+                        if not is_valid and not final_claim_retry_done:
+                            final_claim_retry_done = True
+                            self.context.add_message("assistant", f"[拦截的未执行回复]{cleaned}")
+                            self.context.add_message("system", correction or "回复声称执行但没有工具证据，请纠正。")
+                            yield _progress(f"[约束] {correction}")
+                            budget.advance()  # 推进预算，即使被拦截
+                            continue
+                        if not is_valid:
+                            yield _progress(f"[约束] {correction}")
+                            cleaned = correction or "我还没有实际执行该任务。"
+                        if thinking:
+                            yield _thinking_delta(thinking)
+                            yield _thinking_done()
                         yield _content(cleaned)
+                        # 检测 __ASK_BLOCK__: 标记（fallback 自动检测）
+                        ask_match = _re.search(r'__ASK_BLOCK__:([a-f0-9\-]+)', full_text)
+                        if ask_match:
+                            question_id = ask_match.group(1)
+                            entry = self._ask_pending.get(question_id)
+                            if entry:
+                                question = entry["question"]
+                                choices = entry["choices"]
+                            else:
+                                question = "请回答以下问题"
+                                choices = []
+                            yield _progress("等待用户回答...")
+                            yield {"type": "ask", "question": question, "choices": choices, "question_id": question_id, "timestamp": _time.time()}
+                            break
+                        # 检测并执行 bash 代码块
+                        executor = self._get_cli_executor()
+                        cmd = executor.extract_from_response(full_text) if executor else None
+                        if cmd:
+                            _t0 = _time.time()
+                            yield _tool_start("terminal", {"command": cmd})
+                            try:
+                                result = await tool_mgr.execute("terminal", {"command": cmd})
+                                elapsed = _time.time() - _t0
+                                is_error = _is_error_result(result)
+                                yield _tool_complete("terminal", result, elapsed, error=is_error)
+                                commands_executed.append(cmd)
+                                # 将命令结果加入上下文，让 LLM 生成最终回复
+                                self.context.add_message("tool", _json.dumps({
+                                    "tool_call_id": "fallback",
+                                    "content": f"[命令执行结果]\n{result}"
+                                }, ensure_ascii=False))
+                                # 再次调用 LLM 生成包含命令结果的最终回复
+                                llm_messages2 = [Message(role=m.role, content=m.content) for m in self.context.get_messages()]
+                                llm_response2 = await self.llm.chat(messages=llm_messages2, tools=None)
+                                if llm_response2.content:
+                                    cleaned2, thinking2 = _clean_thinking(llm_response2.content)
+                                    if thinking2:
+                                        yield _thinking_delta(thinking2)
+                                        yield _thinking_done()
+                                    final_response_chunks.append(cleaned2)
+                                    yield _content(cleaned2)
+                            except Exception as _exec_err:
+                                elapsed = _time.time() - _t0
+                                yield _tool_error("terminal", str(_exec_err))
+                        else:
+                            final_response_chunks.append(cleaned)
+                    # 推进预算（正常退出：有文本响应，工具调用轮次结束）
+                    budget.advance()
                     break
+
+                # ── interim_assistant_callback：流式输出中间思考 ──
+                if interim_assistant_callback and llm_response.content:
+                    try:
+                        interim_assistant_callback(llm_response.content)
+                    except Exception as e:
+                        logger.warning(f"interim_assistant_callback 执行失败: {e}")
 
                 # ── 处理工具调用 ──
                 tool_calls_data = [
@@ -516,12 +1027,22 @@ class AgentEngine:
 
                     yield _tool_start(tool_name, args)
                     _tool_t0 = _time.time()
+                    is_error = True
 
                     try:
                         tool_result = await tool_mgr.execute(tool_name, args)
                         _elapsed = _time.time() - _tool_t0
-                        yield _tool_complete(tool_name, tool_result, _elapsed)
-                        result_structured = _tool_result_structured(tool_name, tc["id"], True, result=tool_result)
+                        is_error = _is_error_result(tool_result)
+                        yield _tool_complete(tool_name, tool_result, _elapsed, error=is_error)
+                        result_structured = _tool_result_structured(tool_name, tc["id"], not is_error, result=tool_result if not is_error else "",
+                            error_msg=tool_result if is_error else "", error_type=_classify_error_type(tool_result) if is_error else "")
+                        # 检测 ask 交互
+                        ask_events = _build_ask_events(tool_result, args)
+                        if ask_events:
+                            ask_triggered = True
+                            for ev in ask_events:
+                                yield ev
+                            break  # 跳出工具执行循环，等待用户回答
                     except Exception as _tool_exec_err:
                         _elapsed = _time.time() - _tool_t0
                         error_msg = str(_tool_exec_err)
@@ -535,7 +1056,28 @@ class AgentEngine:
                     if tool_name == "terminal":
                         commands_executed.append(args.get("command", ""))
 
-                    self.context.add_message("tool", _json.dumps(result_structured, ensure_ascii=False))
+                    # 存储易读的纯文本
+                    tool_text = _format_tool_result_text(
+                        name=tool_name,
+                        success=not is_error,
+                        result=tool_result if not is_error else "",
+                        error_msg=tool_result if is_error else "",
+                        error_type=_classify_error_type(tool_result) if is_error else "",
+                        suggestion=result_structured.get("suggestion", "") if is_error else "",
+                        tool_call_id=tc["id"]
+                    )
+                    self.context.add_message("tool", tool_text)
+
+                    # 约束：记录工具执行结果，防止 agent 幻觉
+                    if self._constraint_engine:
+                        self._constraint_engine.record_tool_execution(
+                            tool_name=tool_name,
+                            arguments=args,
+                            result=tool_result,
+                            success=not is_error,
+                            timestamp=_time.time()
+                        )
+                        tool_results_for_hermes.append((tool_name, tool_result))
 
                 # 执行 safe 模式（并行）
                 if safe_calls:
@@ -544,23 +1086,53 @@ class AgentEngine:
                         tool_name = tc["function"]["name"]
                         args = _json.loads(tc["function"]["arguments"])
                         tools_used.append(tool_name)
-                        tool_result = safe_results.get(tc["id"], "Unknown result")
+                        result_elapsed = safe_results.get(tc["id"], ("Unknown result", 0.0))
+                        tool_result, _elapsed = result_elapsed if isinstance(result_elapsed, tuple) else (str(result_elapsed), 0.0)
 
                         yield _tool_start(tool_name, args)
-                        _tool_t0 = _time.time()
-                        _elapsed = _time.time() - _tool_t0
-
-                        is_error = tool_result.startswith("工具执行失败")
+                        is_error = _is_error_result(tool_result)
                         yield _tool_complete(tool_name, tool_result, _elapsed, error=is_error)
                         result_structured = _tool_result_structured(
                             tool_name, tc["id"], not is_error, result=tool_result if not is_error else "",
                             error_msg=tool_result if is_error else "", error_type=_classify_error_type(tool_result) if is_error else ""
                         )
+                        # 检测 ask 交互
+                        if not is_error:
+                            ask_events = _build_ask_events(tool_result, args)
+                            if ask_events:
+                                ask_triggered = True
+                                for ev in ask_events:
+                                    yield ev
+                                break  # 跳出 safe 执行循环
 
                         if tool_name == "terminal":
                             commands_executed.append(args.get("command", ""))
 
-                        self.context.add_message("tool", _json.dumps(result_structured, ensure_ascii=False))
+                        # 存储易读的纯文本
+                        tool_text = _format_tool_result_text(
+                            name=tool_name,
+                            success=not is_error,
+                            result=tool_result if not is_error else "",
+                            error_msg=tool_result if is_error else "",
+                            error_type=_classify_error_type(tool_result) if is_error else "",
+                            suggestion=result_structured.get("suggestion", "") if is_error else "",
+                            tool_call_id=tc["id"]
+                        )
+                        self.context.add_message("tool", tool_text)
+
+                        if self._constraint_engine:
+                            self._constraint_engine.record_tool_execution(
+                                tool_name=tool_name,
+                                arguments=args,
+                                result=tool_result,
+                                success=not is_error,
+                                timestamp=_time.time()
+                            )
+                            tool_results_for_hermes.append((tool_name, tool_result))
+
+                if ask_triggered:
+                    budget.advance()  # 推进预算
+                    break  # ask 交互触发，等待用户回答
 
                 # 执行 path_scoped 模式（目前串行，后续可扩展路径冲突检测）
                 for tc in path_scoped_calls:
@@ -570,12 +1142,22 @@ class AgentEngine:
 
                     yield _tool_start(tool_name, args)
                     _tool_t0 = _time.time()
+                    is_error = True
 
                     try:
                         tool_result = await tool_mgr.execute(tool_name, args)
                         _elapsed = _time.time() - _tool_t0
-                        yield _tool_complete(tool_name, tool_result, _elapsed)
-                        result_structured = _tool_result_structured(tool_name, tc["id"], True, result=tool_result)
+                        is_error = _is_error_result(tool_result)
+                        yield _tool_complete(tool_name, tool_result, _elapsed, error=is_error)
+                        result_structured = _tool_result_structured(tool_name, tc["id"], not is_error, result=tool_result if not is_error else "",
+                            error_msg=tool_result if is_error else "", error_type=_classify_error_type(tool_result) if is_error else "")
+                        # 检测 ask 交互
+                        ask_events = _build_ask_events(tool_result, args)
+                        if ask_events:
+                            ask_triggered = True
+                            for ev in ask_events:
+                                yield ev
+                            break  # 跳出 path_scoped 执行循环
                     except Exception as _tool_exec_err:
                         _elapsed = _time.time() - _tool_t0
                         error_msg = str(_tool_exec_err)
@@ -586,11 +1168,57 @@ class AgentEngine:
                             tool_name, tc["id"], False, error_msg=error_msg, error_type=error_type
                         )
 
-                    self.context.add_message("tool", _json.dumps(result_structured, ensure_ascii=False))
+                    if tool_name == "terminal":
+                        commands_executed.append(args.get("command", ""))
+
+                    # 存储易读的纯文本
+                    tool_text = _format_tool_result_text(
+                        name=tool_name,
+                        success=False,
+                        result="",
+                        error_msg=error_msg,
+                        error_type=error_type,
+                        suggestion=result_structured.get("suggestion", ""),
+                        tool_call_id=tc.get("id", "")
+                    )
+                    self.context.add_message("tool", tool_text)
+
+                    if self._constraint_engine:
+                        self._constraint_engine.record_tool_execution(
+                            tool_name=tool_name,
+                            arguments=args,
+                            result=tool_result,
+                            success=False,
+                            timestamp=_time.time()
+                        )
+                        tool_results_for_hermes.append((tool_name, tool_result))
+
+                if ask_triggered:
+                    budget.advance()  # 推进预算
+                    break  # ask 交互触发，等待用户回答
+
+                # ── Hermes 循环控制：在推进预算前，客观判断是否该继续 ──
+                if self._constraint_engine and tool_results_for_hermes:
+                    should_cont, reason = self._constraint_engine.should_continue_loop(
+                        tools_used=tools_used,
+                        tool_results=tool_results_for_hermes,
+                        current_round=budget.current_round + 1
+                    )
+                    if not should_cont:
+                        logger.info(f"[Hermes] 循环控制: {reason}")
+                        yield _progress(f"[Hermes] {reason}")
+                        final_text = await _summarize_from_existing_context(
+                            f"[循环终止] {reason}\n基于已有工具执行结果生成总结。"
+                        )
+                        final_response_chunks.append(final_text)
+                        yield _content(final_text)
+                        break
 
                 # 推进预算
                 if not budget.advance():
-                    yield _content(budget.get_exhausted_message())
+                    final_text = await _summarize_from_existing_context(budget.get_exhausted_message())
+                    final_response_chunks.append(final_text)
+                    yield _content(final_text)
                     break
 
         except Exception as e:
@@ -609,25 +1237,32 @@ class AgentEngine:
         yield _progress("保存对话记录...")
         # 收集完整回复用于存储（从 context 最后的 assistant 消息中取）
         import re
-        final_reply = ""
-        for m in reversed(self.context.get_messages()):
-            if m.role == "assistant":
-                try:
-                    d = _json.loads(m.content)
-                    final_reply = d.get("content", "")
-                except (_json.JSONDecodeError, AttributeError):
-                    final_reply = m.content
-                if final_reply:
-                    break
+        final_reply = "".join(final_response_chunks).strip()
+        if not final_reply:
+            for m in reversed(self.context.get_messages()):
+                if m.role == "assistant":
+                    try:
+                        d = _json.loads(m.content)
+                        final_reply = d.get("content", "")
+                    except (_json.JSONDecodeError, AttributeError):
+                        final_reply = m.content
+                    if final_reply:
+                        break
         if not final_reply:
             final_reply = "（无回复内容）"
-        # 清理 <think>... 标记，不存入数据库
-        final_reply = re.sub(r'<think>.*?', '', final_reply, flags=re.DOTALL).strip()
+        # 清理 <think>...晖 思考标签，不存入数据库
+        final_reply = re.sub(r'<think>[\s\S]*?晖', '', final_reply, flags=re.DOTALL).strip()
+        final_reply = re.sub(r'<think>[\s\S]*?</think>', '', final_reply, flags=re.DOTALL).strip()
+        # 清理 Qwen 风格的 <|im_start|>...<|im_end|> 标签
+        final_reply = re.sub(r'<\|im_start\|[^|]*\|[^>]*>[\s\S]*?<\|im_end\|>', '', final_reply).strip()
 
         self.context.add_message("assistant", final_reply)
         await self.memory_storage.add_message(session_id, "user", message)
         await self.memory_storage.add_message(session_id, "assistant", final_reply)
         self.context.clear()
+        # 重置 Hermes 约束引擎状态，避免跨任务误判循环
+        if self._constraint_engine:
+            self._constraint_engine.reset_session()
 
         yield _done()
 

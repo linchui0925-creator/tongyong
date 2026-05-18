@@ -22,10 +22,11 @@ class ToolCallResult:
 class LLMResponse:
     """LLM响应，支持纯文本和工具调用"""
 
-    def __init__(self, content: str = "", tool_calls: Optional[List[ToolCallResult]] = None, thinking: Optional[List[str]] = None):
+    def __init__(self, content: str = "", tool_calls: Optional[List[ToolCallResult]] = None, thinking: Optional[List[str]] = None, usage: Optional[Dict[str, int]] = None):
         self.content = content
         self.tool_calls = tool_calls or []
         self.thinking = thinking or []
+        self.usage = usage or {}  # {"input_tokens": int, "output_tokens": int, "total_tokens": int}
 
     @property
     def has_tool_calls(self) -> bool:

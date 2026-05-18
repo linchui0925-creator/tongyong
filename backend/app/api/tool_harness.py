@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from typing import Dict, Any, Optional, List
 import logging
 
-from app.tools.registry import registry, discover_and_import_tools
+from app.tools.registry import registry, discover_builtin_tools
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +24,15 @@ class ToolExecutionRequest(BaseModel):
 
 def _ensure_tools_discovered():
     """确保工具已加载"""
-    if not registry.list_tools():
-        discover_and_import_tools()
+    if not registry.get_all_tool_names():
+        discover_builtin_tools()
 
 
 @router.get("")
 async def list_tools() -> Dict[str, Any]:
     """获取所有注册的工具列表"""
     _ensure_tools_discovered()
-    names = registry.list_tools()
+    names = registry.get_all_tool_names()
     schemas = registry.get_schemas()
     return {
         "total": len(names),

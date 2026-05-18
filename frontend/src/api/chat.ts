@@ -192,3 +192,27 @@ export async function checkHealth(): Promise<boolean> {
         return false
     }
 }
+
+/**
+ * 提交 clarify 问题的用户回答
+ */
+export async function submitClarifyAnswer(
+    questionId: string,
+    answer: string,
+    sessionId?: string
+): Promise<{ success: boolean; error?: string }> {
+    try {
+        const response = await api.post('/clarify', {
+            question_id: questionId,
+            answer,
+            session_id: sessionId || undefined
+        })
+        return response.data
+    } catch (error) {
+        console.error('[提交回答失败]', error)
+        if (axios.isAxiosError(error)) {
+            return { success: false, error: error.message }
+        }
+        return { success: false, error: '提交回答失败' }
+    }
+}

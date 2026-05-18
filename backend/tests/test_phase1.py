@@ -316,6 +316,7 @@ class TestToolRegistry:
         """测试工具创建"""
         tool = ToolEntry(
             name="test_tool",
+            toolset="test_toolset",
             description="test description",
             schema={},
             handler=lambda: None

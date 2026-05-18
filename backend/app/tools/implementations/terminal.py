@@ -13,66 +13,9 @@ import shlex
 from typing import Optional
 
 from app.tools.registry import registry
+from app.tools.security_config import _ALLOWED_COMMANDS, _FORBIDDEN_PATTERNS
 
 logger = logging.getLogger(__name__)
-
-# ── 安全配置 ────────────────────────────────────────────
-
-_ALLOWED_COMMANDS = [
-    # 文件查看
-    "cat", "less", "more", "head", "tail", "wc", "diff",
-    # 文件操作
-    "cp", "mv", "rm", "touch", "mkdir", "chmod", "chown",
-    # 文本处理
-    "grep", "rg", "awk", "sed", "sort", "uniq",
-    # 文件查找
-    "find", "locate", "which", "type",
-    # 目录与路径
-    "ls", "pwd", "cd", "tree", "du", "df",
-    # 进程管理
-    "ps", "top", "htop", "kill", "killall",
-    # 网络
-    "curl", "wget", "ping", "nc", "ss", "netstat",
-    # 压缩
-    "tar", "gzip", "gunzip", "zip", "unzip", "bzip2", "xz",
-    # SHELL 内置
-    "echo", "printf", "source", "export",
-    # Python 生态
-    "python", "python3", "pip", "pip3", "pytest", "mypy", "ruff", "black", "flake8", "uv",
-    # Node 生态
-    "node", "npm", "npx", "yarn", "pnpm", "bun",
-    # 版本控制
-    "git", "svn",
-    # 容器
-    "docker", "docker-compose",
-    # 数据库
-    "sqlite3", "redis-cli", "psql", "mysql",
-    # 构建工具
-    "make", "cmake", "cargo", "rustc", "go", "gcc", "g++", "clang",
-    # 系统信息
-    "date", "cal", "whoami", "id", "uname", "hostname", "uptime", "dmesg",
-    # macOS 特定
-    "open", "brew", "sw_vers", "defaults", "plutil",
-    # 环境
-    "env", "printenv", "xargs", "time", "watch",
-    # 编码与校验
-    "base64", "shasum", "sha256sum", "md5sum",
-    # 浏览器自动化 — 已移除: 使用专用的 browser 工具
-    # "playwright",
-    # 杂项
-    "jq", "yq", "rsync", "screen", "tmux",
-]
-
-_FORBIDDEN_PATTERNS = [
-    r"rm\s+-rf\s+/",
-    r"sudo\s+",
-    r"curl.*\|.*sh",
-    r"wget.*\|.*sh",
-    r">\s*/etc/",
-    r"mkfs",
-    r"dd\s+.*of=/dev/",
-    r":\(\)\{\s*:\|:",
-]
 
 _MAX_OUTPUT_CHARS = 100_000
 _DEFAULT_TIMEOUT = 60
@@ -189,6 +132,7 @@ async def terminal_tool(command: str, timeout: int = _DEFAULT_TIMEOUT, workdir: 
 
 registry.register(
     name="terminal",
+    toolset="terminal",
     description="执行 shell 命令（编译、运行、安装、git、文件操作等）。支持超时、工作目录、后台执行。注意：不要用此工具实现浏览器操作（打开网页、截图等）——请使用专门的 browser 工具。",
     schema=TERMINAL_SCHEMA,
     handler=terminal_tool,

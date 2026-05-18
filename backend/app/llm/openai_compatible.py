@@ -73,7 +73,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     if isinstance(parsed, dict) and "tool_calls" in parsed:
                         new_msg = {
                             "role": "assistant",
-                            "content": parsed.get("content") or None,
+                            "content": parsed.get("content") or "",
                             "tool_calls": parsed["tool_calls"],
                         }
                         normalized.append(new_msg)
@@ -99,6 +99,36 @@ class OpenAICompatibleLLM(BaseLLM):
             normalized.append(msg)
         return normalized
 
+    @staticmethod
+    def _decode_json_response(resp: httpx.Response) -> Dict:
+        """稳健解析 JSON 响应，兼容 BOM、空响应和部分兼容 API 的脏前缀。"""
+        try:
+            return resp.json()
+        except json.JSONDecodeError as e:
+            raw_text = resp.text or ""
+            preview = raw_text[:500]
+            logger.warning(
+                "OpenAI-compatible JSON解析失败: status=%s content-type=%s preview=%r",
+                resp.status_code,
+                resp.headers.get("content-type", ""),
+                preview,
+            )
+
+            cleaned = raw_text.lstrip("\ufeff \t\r\n")
+            if not cleaned:
+                raise LLMError("响应体为空，无法解析模型返回", "EMPTY_RESPONSE") from e
+
+            json_start = cleaned.find("{")
+            json_end = cleaned.rfind("}")
+            if json_start != -1 and json_end > json_start:
+                candidate = cleaned[json_start:json_end + 1]
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    pass
+
+            raise LLMError("响应不是有效 JSON", "INVALID_JSON_RESPONSE", preview) from e
+
     # ── 对话 ──────────────────────────────────────────────
 
     async def chat(self, messages: List[Message], tools: Optional[List[Dict]] = None) -> LLMResponse:
@@ -120,6 +150,11 @@ class OpenAICompatibleLLM(BaseLLM):
         if tools:
             body["tools"] = tools
 
+        # Debug: 记录发送的消息格式
+        logger.info(f"[LLM Debug] 发送 {len(openai_messages)} 条消息")
+        for i, msg in enumerate(openai_messages[:5]):
+            logger.info(f"  消息{i}: role={msg.get('role')}, has_tool_call_id={'tool_call_id' in msg if isinstance(msg, dict) else 'N/A'}")
+
         for attempt in range(self.MAX_RETRIES):
             try:
                 async with httpx.AsyncClient(timeout=self.REQUEST_TIMEOUT) as client:
@@ -129,7 +164,7 @@ class OpenAICompatibleLLM(BaseLLM):
                         json=body,
                     )
                     resp.raise_for_status()
-                    result = resp.json()
+                    result = self._decode_json_response(resp)
                     return self._parse_response(result)
 
             except httpx.TimeoutException:
@@ -196,7 +231,7 @@ class OpenAICompatibleLLM(BaseLLM):
                     json={"model": self._embedding_model(), "input": text},
                 )
                 resp.raise_for_status()
-                result = resp.json()
+                result = self._decode_json_response(resp)
                 if "data" in result and len(result["data"]) > 0:
                     return result["data"][0]["embedding"]
         except Exception as e:
@@ -309,7 +344,7 @@ class OpenAICompatibleLLM(BaseLLM):
 
         return LLMResponse(content=content, thinking=thinking_chunks)
 
-    def _generate_fallback_embedding(text: str) -> List[float]:
+    def _generate_fallback_embedding(self, text: str) -> List[float]:
         import hashlib
         hash_bytes = hashlib.sha256(text.encode()).digest()
         return [(hash_bytes[i % len(hash_bytes)] / 128.0) - 1.0 for i in range(1024)]
@@ -353,6 +388,43 @@ class MiniMaxLLM(OpenAICompatibleLLM):
     def __init__(self, api_key: str, model: str = None):
         super().__init__(api_key, model)
         self.api_base = self.DEFAULT_API_BASE
+
+    def _parse_response(self, result: Dict) -> LLMResponse:
+        """解析响应，清理 Qwen 风格的 thinking 标签后再解析"""
+        import re
+
+        choices = result.get("choices", [])
+        if not choices:
+            raise LLMError("响应格式错误", "INVALID_RESPONSE", result)
+
+        message = choices[0].get("message", {})
+        content = message.get("content") or ""
+
+        # MiniMax 模型可能输出 Qwen 风格的 <|im_start|>...<|im_end|> 标记
+        # 或 <think>...晖 思考标签，直接清理掉
+        content = re.sub(r'<\|im_start\|[^|]*\|[^>]*>[\s\S]*?<\|im_end\|>', '', content)
+        content = re.sub(r'<think>[\s\S]*?晖', '', content)
+        content = content.strip()
+
+        # 工具调用
+        tool_calls_raw = message.get("tool_calls", [])
+        if tool_calls_raw:
+            tool_calls = []
+            for tc in tool_calls_raw:
+                func = tc.get("function", {})
+                args_str = func.get("arguments", "{}")
+                try:
+                    arguments = json.loads(args_str) if isinstance(args_str, str) else args_str
+                except json.JSONDecodeError:
+                    arguments = {}
+                tool_calls.append(ToolCallResult(
+                    tool_name=func.get("name", ""),
+                    arguments=arguments,
+                    tool_call_id=tc.get("id", ""),
+                ))
+            return LLMResponse(content=content, tool_calls=tool_calls)
+
+        return LLMResponse(content=content)
 
 
 class MoonshotLLM(OpenAICompatibleLLM):

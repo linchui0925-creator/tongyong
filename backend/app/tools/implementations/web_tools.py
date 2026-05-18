@@ -182,6 +182,7 @@ def _html_to_text(html: str) -> str:
 
 registry.register(
     name="web_search",
+    toolset="web",
     description="搜索互联网。输入关键词，返回标题、链接和摘要。适合查找最新信息、文档、新闻等。",
     schema=WEB_SEARCH_SCHEMA,
     handler=web_search_tool,
@@ -192,6 +193,7 @@ registry.register(
 
 registry.register(
     name="web_extract",
+    toolset="web",
     description="获取网页内容并提取纯文本。适合查看文章、文档页面等。",
     schema=WEB_EXTRACT_SCHEMA,
     handler=web_extract_tool,
